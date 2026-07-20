@@ -11,6 +11,7 @@ import {
   type ResolvedSession,
 } from '@whereareyou/protocol';
 import type { Config } from './config.js';
+import type { RateLimitDecision, RateLimiter, RateSource } from './rate-limit.js';
 import type { SessionStore, StoredSession } from './store.js';
 
 function fail(reply: FastifyReply, status: number, error: ProtocolErrorCode, message: string) {
@@ -87,15 +88,82 @@ function identifyResolver(config: Config, request: FastifyRequest): string | nul
   return config.apiKeys.get(header.slice('Bearer '.length)) ?? null;
 }
 
-export function registerRoutes(app: FastifyInstance, config: Config, store: SessionStore): void {
+/**
+ * The axes this request is limited on.
+ *
+ * IP always. Resolver key as well, when there is one, because the two catch
+ * different attacks: one host grinding through the codespace is caught by IP, a
+ * leaked control-room key used from everywhere is caught by the key.
+ */
+function rateSourcesFor(request: FastifyRequest, resolver: string | null): RateSource[] {
+  const sources: RateSource[] = [{ scope: 'ip', id: request.ip }];
+  // 'anonymous' is what open mode reports for everybody, so it is not an
+  // identity and must not become a single shared bucket for the whole world.
+  if (resolver !== null && resolver !== 'anonymous') {
+    sources.push({ scope: 'key', id: resolver });
+  }
+  return sources;
+}
+
+function refuse(reply: FastifyReply, decision: Extract<RateLimitDecision, { allowed: false }>) {
+  reply.header('Retry-After', String(decision.retryAfterSeconds));
+  return fail(
+    reply,
+    429,
+    'rate-limited',
+    `too many failed lookups; retry in ${decision.retryAfterSeconds}s`,
+  );
+}
+
+/**
+ * Everything the routes need beyond config and the store.
+ *
+ * An options object rather than positional parameters: three separate tickets
+ * each wanted to add a fourth argument, and the third would have had to guess
+ * what the first two chose. Named fields let them converge without coordinating.
+ */
+export interface RouteOptions {
+  /**
+   * Whether expiry is enforced by the datastore itself rather than by this
+   * process. Surfaced on `/health` so that "a record cannot outlive its TTL" is
+   * an observable fact about a running deployment rather than a claim in a
+   * README that nobody can check from outside.
+   */
+  structuralExpiry?: boolean | undefined;
+  /** Absent means no enumeration defence — local development only. */
+  limiter?: RateLimiter | undefined;
+}
+
+export function registerRoutes(
+  app: FastifyInstance,
+  config: Config,
+  store: SessionStore,
+  options: RouteOptions = {},
+): void {
+  const { structuralExpiry = false, limiter } = options;
+
   app.get('/health', async () => ({
     status: 'ok',
     resolverMode: config.resolverMode,
     liveSessions: await store.size(),
+    structuralExpiry,
+    rateLimiting: limiter !== undefined,
   }));
 
   // ---- Mint -------------------------------------------------------------
   app.post('/v1/sessions', async (request, reply) => {
+    // Loose by design. Someone pressing the button because they are in trouble
+    // must get through; absorbing some junk is the cheaper failure.
+    const mintSources = rateSourcesFor(request, null);
+    if (limiter !== undefined) {
+      const decision = await limiter.checkMint(mintSources);
+      if (!decision.allowed) {
+        request.log.warn({ event: 'mint.rate-limited', scope: decision.scope }, 'mint throttled');
+        return refuse(reply, decision);
+      }
+      await limiter.recordMint(mintSources);
+    }
+
     const body = (request.body ?? {}) as Record<string, unknown>;
 
     const validated = validatePosition(body['position']);
@@ -153,7 +221,41 @@ export function registerRoutes(app: FastifyInstance, config: Config, store: Sess
   // ---- Resolve ----------------------------------------------------------
   app.get<{ Params: { code: string } }>('/v1/sessions/:code', async (request, reply) => {
     const resolver = identifyResolver(config, request);
+    const sources = rateSourcesFor(request, resolver);
+
+    // Checked before anything else — before auth, before parsing, and long
+    // before the datastore — so that a source already known to be enumerating
+    // costs almost nothing to reject.
+    if (limiter !== undefined) {
+      const decision = await limiter.checkResolve(sources);
+      if (!decision.allowed) {
+        // A blocked source that keeps probing is charged for it. Without this
+        // the miss streak freezes the moment the first block lands — nothing
+        // further is ever recorded — and the "exponential" backoff flattens
+        // into a fixed short penalty an attacker can simply sleep through.
+        // Continuing to hammer a 429 is also about the clearest signal of
+        // intent available: a dispatcher honours Retry-After, a scanner does
+        // not.
+        await limiter.recordResolve(sources, 'miss');
+        request.log.warn(
+          { event: 'session.resolve', outcome: 'rate-limited', scope: decision.scope },
+          'resolve throttled',
+        );
+        return refuse(reply, decision);
+      }
+    }
+
+    // Every failure path below charges a miss. Note what counts as one: a bad
+    // API key, a malformed code, an unknown code, and a code owned by another
+    // control room. All four are things a dispatcher reading a code off a live
+    // caller essentially never does, and all four are things enumeration does
+    // constantly.
+    const charge = async (outcome: 'hit' | 'miss') => {
+      if (limiter !== undefined) await limiter.recordResolve(sources, outcome);
+    };
+
     if (resolver === null) {
+      await charge('miss');
       return fail(reply, 401, 'unauthorised', 'a valid resolver API key is required');
     }
 
@@ -162,6 +264,7 @@ export function registerRoutes(app: FastifyInstance, config: Config, store: Sess
     // surface for enumeration.
     const parsed = parseCode(request.params.code);
     if (!parsed.ok) {
+      await charge('miss');
       request.log.info(
         { event: 'session.resolve', outcome: 'invalid-code', reason: parsed.reason, resolver },
         'resolve rejected',
@@ -175,7 +278,8 @@ export function registerRoutes(app: FastifyInstance, config: Config, store: Sess
     // claimed by a different resolver. Distinguishing them would confirm to an
     // attacker that a guessed code is real — the exact signal enumeration
     // defence exists to deny.
-    const deny = () => {
+    const deny = async () => {
+      await charge('miss');
       request.log.info(
         { event: 'session.resolve', outcome: 'not-found', code: parsed.code, resolver },
         'resolve denied',
@@ -193,6 +297,8 @@ export function registerRoutes(app: FastifyInstance, config: Config, store: Sess
         session.claimedBy = resolver;
       }
     }
+
+    await charge('hit');
 
     // Audit: records THAT a lookup happened, never where. Full accountability,
     // no location history database.
