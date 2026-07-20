@@ -1,0 +1,71 @@
+# Render blueprint for the whereareyou resolver node.
+#
+# Deploy: push this file, then in the Render dashboard choose
+# New → Blueprint and point it at this repo. Render reads this and creates
+# both services. You will be asked to set API_KEYS (see below).
+#
+# NOTE ON THE FREE TIER: a free web service spins down after ~15 minutes of
+# inactivity and takes 30-50s to wake. That is fine for test users clicking
+# through, and obviously wrong for anything real — an emergency resolver that
+# needs a minute to boot is not a resolver. Upgrade the plan before this is
+# pointed at anyone who might actually need it.
+
+services:
+  - type: web
+    name: whereareyou-api
+    runtime: node
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:prod
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+
+      # Redis, wired from the instance below. This is what makes expiry
+      # structural rather than policy — without it the store falls back to
+      # memory and the privacy claim stops being true.
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: whereareyou-redis
+          property: connectionString
+
+      # apikey, not open. `open` disables claim-on-read entirely and lets
+      # anyone resolve any code, which is a demo affordance rather than a
+      # deployment one.
+      - key: RESOLVER_MODE
+        value: apikey
+
+      # Format: key:identity,key:identity
+      # Not committed — set this in the dashboard. Must be non-empty or the
+      # process refuses to start.
+      - key: API_KEYS
+        sync: false
+
+      # The GitHub Pages origin. Without it the browser blocks every request
+      # from the deployed front end.
+      - key: CORS_ORIGINS
+        value: https://stu-greenshoots.github.io
+
+      # Render terminates TLS in front of the app, so the client IP arrives in
+      # X-Forwarded-For. Without this every request looks like it comes from
+      # Render's proxy and the per-IP rate limit becomes one shared bucket.
+      - key: TRUST_PROXY
+        value: 'true'
+
+      - key: LOG_LEVEL
+        value: info
+
+  - type: redis
+    name: whereareyou-redis
+    plan: free
+    region: frankfurt
+    # Only the API talks to it; nothing external should.
+    ipAllowList: []
+    # Sessions carry their own TTL and must be allowed to expire naturally.
+    # Never evict early under memory pressure — a code vanishing before its
+    # stated expiry is worse than a write failing loudly.
+    maxmemoryPolicy: noeviction
