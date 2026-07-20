@@ -1,6 +1,12 @@
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
 import { loadConfig } from './config.js';
+import {
+  MemoryRateLimitBackend,
+  RateLimiter,
+  RedisRateLimitBackend,
+  type RateLimitBackend,
+} from './rate-limit.js';
 import { registerRoutes } from './routes.js';
 import { createStore, type SelectedStore } from './store-factory.js';
 
@@ -16,6 +22,10 @@ const app = Fastify({
       censor: '[redacted]',
     },
   },
+  // Off unless explicitly enabled. With no proxy in front, honouring
+  // X-Forwarded-For would let a caller mint a fresh rate-limit identity per
+  // request and walk straight through the per-IP budget.
+  trustProxy: config.rateLimit.trustProxy,
 });
 
 // Selected before the server listens, so an unreachable Redis stops the process
@@ -35,15 +45,33 @@ try {
   process.exit(1);
 }
 
+let limiter: RateLimiter | undefined;
+
+if (config.rateLimit.enabled) {
+  // Share the store's connection rather than opening a second one. Both
+  // subsystems need Redis for the same reason and their key prefixes do not
+  // collide; a separate socket would only add another retry strategy and
+  // another failure mode to reason about.
+  const backend: RateLimitBackend =
+    selected.redis !== undefined
+      ? new RedisRateLimitBackend(selected.redis)
+      : new MemoryRateLimitBackend();
+  limiter = new RateLimiter(backend, config.rateLimit.policy, app.log);
+}
+
 await app.register(cors, {
   origin: config.corsOrigins.includes('*') ? true : config.corsOrigins,
 });
 
-registerRoutes(app, config, selected.store, { structuralExpiry: selected.structuralExpiry });
+registerRoutes(app, config, selected.store, {
+  structuralExpiry: selected.structuralExpiry,
+  limiter,
+});
 
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, 'shutting down');
   await app.close();
+  // Closes the shared connection, which the limiter was borrowing.
   await selected.close();
   process.exit(0);
 };
@@ -58,6 +86,8 @@ try {
       resolverMode: config.resolverMode,
       store: selected.kind,
       structuralExpiry: selected.structuralExpiry,
+      rateLimiting: config.rateLimit.enabled,
+      rateLimitBackend: selected.redis !== undefined ? 'redis' : 'memory',
     },
     `whereareyou resolver node ready — session store: ${selected.kind.toUpperCase()}`,
   );
@@ -76,6 +106,34 @@ try {
         "process's heap and are removed by a sweeper, so the bytes linger between sweeps " +
         'and a restart drops every live code. Set REDIS_URL to get the guarantee the ' +
         'protocol documentation describes. Do not run this configuration anywhere real.',
+    );
+  }
+
+  if (config.rateLimit.enabled) {
+    const { policy } = config.rateLimit;
+    app.log.info(
+      {
+        budget: policy.resolveBudget,
+        windowSeconds: policy.resolveWindowSeconds,
+        hitCost: policy.resolveHitCost,
+        missCost: policy.resolveMissCost,
+        missesToExhaust: Math.ceil(policy.resolveBudget / policy.resolveMissCost),
+        hitsToExhaust: Math.ceil(policy.resolveBudget / policy.resolveHitCost),
+      },
+      `enumeration defence active — a failed resolve costs ${
+        policy.resolveMissCost / policy.resolveHitCost
+      }x a successful one`,
+    );
+    if (selected.redis === undefined) {
+      app.log.warn(
+        'rate-limit counters are in-process — they reset on restart and are not shared ' +
+          'between instances. Set REDIS_URL for limits that actually hold.',
+      );
+    }
+  } else {
+    app.log.warn(
+      'RATE_LIMIT_ENABLED=false — no enumeration defence. The resolver can be walked ' +
+        'through the codespace. Local development only.',
     );
   }
 

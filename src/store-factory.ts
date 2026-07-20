@@ -1,3 +1,4 @@
+import type { Redis } from 'ioredis';
 import { MemorySessionStore, type SessionStore } from './store.js';
 import { RedisSessionStore, connectRedis } from './store-redis.js';
 
@@ -15,6 +16,20 @@ export interface SelectedStore {
    * the protocol documentation claims.
    */
   structuralExpiry: boolean;
+  /**
+   * The store's Redis connection, when there is one, so other subsystems can
+   * share it rather than opening their own.
+   *
+   * Present because the rate limiter needs Redis for exactly the same reason
+   * the store does, and a second connection to the same server buys nothing but
+   * another socket, another retry strategy to reason about, and another failure
+   * mode. Key prefixes do not collide (`sess:` and `rl:`), which is why
+   * `RedisSessionStore.size()` uses SCAN rather than DBSIZE.
+   *
+   * Undefined for the memory store, and callers must handle that rather than
+   * assuming Redis is available.
+   */
+  redis?: Redis;
 }
 
 /**
@@ -43,6 +58,7 @@ export async function createStore(redisUrl: string | undefined): Promise<Selecte
     store,
     kind: 'redis',
     structuralExpiry: true,
+    redis,
     close: () => store.close(),
   };
 }
