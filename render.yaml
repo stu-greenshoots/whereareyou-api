@@ -29,8 +29,8 @@ services:
       # memory and the privacy claim stops being true.
       - key: REDIS_URL
         fromService:
-          type: redis
-          name: whereareyou-redis
+          type: keyvalue
+          name: whereareyou-keyvalue
           property: connectionString
 
       # apikey, not open. `open` disables claim-on-read entirely and lets
@@ -59,8 +59,9 @@ services:
       - key: LOG_LEVEL
         value: info
 
-  - type: redis
-    name: whereareyou-redis
+  # "keyvalue" is Render's current name for this; "redis" is a deprecated alias.
+  - type: keyvalue
+    name: whereareyou-keyvalue
     plan: free
     region: frankfurt
     # Only the API talks to it; nothing external should.
