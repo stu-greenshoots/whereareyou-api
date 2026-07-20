@@ -21,6 +21,13 @@ export interface Config {
   minTtlSeconds: number;
   maxTtlSeconds: number;
   corsOrigins: string[];
+  /**
+   * Redis connection string. Absent selects the in-memory store, which does
+   * NOT deliver structural expiry — see the warning in `store.ts`. Present
+   * makes Redis mandatory: if it will not connect, the process refuses to
+   * start rather than falling back and quietly weakening its own guarantee.
+   */
+  redisUrl: string | undefined;
 }
 
 function int(name: string, fallback: number): number {
@@ -80,5 +87,6 @@ export function loadConfig(): Config {
     minTtlSeconds,
     maxTtlSeconds,
     corsOrigins: (process.env['CORS_ORIGINS'] ?? '*').split(',').map((o) => o.trim()),
+    redisUrl: process.env['REDIS_URL'] === '' ? undefined : process.env['REDIS_URL'],
   };
 }

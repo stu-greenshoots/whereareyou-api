@@ -87,11 +87,27 @@ function identifyResolver(config: Config, request: FastifyRequest): string | nul
   return config.apiKeys.get(header.slice('Bearer '.length)) ?? null;
 }
 
-export function registerRoutes(app: FastifyInstance, config: Config, store: SessionStore): void {
+export interface RuntimeInfo {
+  /**
+   * Whether expiry is enforced by the datastore itself rather than by this
+   * process. Surfaced on `/health` so that "a record cannot outlive its TTL" is
+   * an observable fact about a running deployment rather than a claim in a
+   * README that nobody can check from outside.
+   */
+  structuralExpiry: boolean;
+}
+
+export function registerRoutes(
+  app: FastifyInstance,
+  config: Config,
+  store: SessionStore,
+  runtime: RuntimeInfo = { structuralExpiry: false },
+): void {
   app.get('/health', async () => ({
     status: 'ok',
     resolverMode: config.resolverMode,
     liveSessions: await store.size(),
+    structuralExpiry: runtime.structuralExpiry,
   }));
 
   // ---- Mint -------------------------------------------------------------
