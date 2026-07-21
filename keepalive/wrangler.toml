@@ -1,0 +1,14 @@
+name = "whereareyou-keepalive"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Every 10 minutes, 06:00–23:59 UTC (≈07:00–00:59 UK summer time).
+#
+# 10-minute interval because Render idles the service after ~15 minutes, so a
+# ping every 10 leaves margin. Restricted to daytime hours so the service
+# sleeps overnight and the month stays under Render's free ~750 instance-hours.
+# Widen the hour range if you want it warm later, at the cost of hours used.
+[triggers]
+crons = ["*/10 6-23 * * *"]
+
+# Cron Triggers are included on the Cloudflare Workers free plan.
