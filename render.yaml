@@ -48,7 +48,7 @@ services:
       # The GitHub Pages origin. Without it the browser blocks every request
       # from the deployed front end.
       - key: CORS_ORIGINS
-        value: https://stu-greenshoots.github.io
+        value: https://whereareyou.stu-bot.uk,https://stu-greenshoots.github.io
 
       # Render terminates TLS in front of the app, so the client IP arrives in
       # X-Forwarded-For. Without this every request looks like it comes from
