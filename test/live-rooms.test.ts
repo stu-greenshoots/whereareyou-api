@@ -327,15 +327,29 @@ describe('zones', () => {
     rooms.stop();
   });
 
-  it('removes a zone for anyone who asks, and stays silent about unknown ids', () => {
-    const { rooms, sockets, ids } = roomOf(2);
-    rooms.zoneCreate('CODE1', ids[0]!, zone('z1'));
-    rooms.zoneRemove('CODE1', ids[1]!, 'z1'); // not the creator: POC posture
+  it('honours a remove only from the creator or the owner; others are silence', () => {
+    const { rooms, sockets, ids } = roomOf(3); // ids[0] is the owner
+    rooms.zoneCreate('CODE1', ids[1]!, zone('z1'));
+
+    // Neither the creator nor the owner: dropped with no frame — the zone
+    // stays, deliberately indistinguishable from an unknown id.
+    rooms.zoneRemove('CODE1', ids[2]!, 'z1');
+    for (const socket of sockets) expect(socket.ofType('zone-removed')).toHaveLength(0);
+
+    // The creator may take their own zone back.
+    rooms.zoneRemove('CODE1', ids[1]!, 'z1');
     for (const socket of sockets) {
       expect(socket.ofType('zone-removed').at(-1)).toMatchObject({ id: 'z1' });
     }
+
+    // The owner may remove anyone's.
+    rooms.zoneCreate('CODE1', ids[1]!, zone('z2'));
+    rooms.zoneRemove('CODE1', ids[0]!, 'z2');
+    expect(sockets[1]!.ofType('zone-removed').at(-1)).toMatchObject({ id: 'z2' });
+
+    // Unknown ids stay silence, from anyone.
     rooms.zoneRemove('CODE1', ids[1]!, 'never-existed');
-    expect(sockets[0]!.ofType('zone-removed')).toHaveLength(1);
+    expect(sockets[0]!.ofType('zone-removed')).toHaveLength(2);
 
     const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
     if (late === 'room-full') throw new Error('unreachable');
@@ -357,7 +371,7 @@ describe('zone detection — the hysteresis contract, verbatim', () => {
     // ...and only the second CONSECUTIVE inside fix is an entry.
     const events = rooms.position('CODE1', ids[1]!, fix(60));
     expect(events).toEqual([
-      { kind: 'entered', participantId: ids[1], zoneId: 'z1', at: expect.any(String) },
+      { kind: 'entered', participantId: ids[1], zoneId: 'z1', targetName: 'weir', at: expect.any(String) },
     ]);
     // Staying inside is not news.
     expect(rooms.position('CODE1', ids[1]!, fix(70))).toEqual([]);
@@ -378,7 +392,7 @@ describe('zone detection — the hysteresis contract, verbatim', () => {
     expect(rooms.position('CODE1', ids[1]!, fix(130, 40))).toEqual([]);
     // 130m at ±5 is past 100 + max(5, 20): that is a leave, on a single fix.
     expect(rooms.position('CODE1', ids[1]!, fix(130, 5))).toEqual([
-      { kind: 'left', participantId: ids[1], zoneId: 'z1', at: expect.any(String) },
+      { kind: 'left', participantId: ids[1], zoneId: 'z1', targetName: 'weir', at: expect.any(String) },
     ]);
     // And re-entering takes two consecutive fixes again.
     expect(rooms.position('CODE1', ids[1]!, fix(50))).toEqual([]);
@@ -397,7 +411,7 @@ describe('zone detection — the hysteresis contract, verbatim', () => {
     // needs its two consecutive fixes from scratch.
     expect(rooms.position('CODE1', ids[1]!, fix(50))).toEqual([]);
     expect(rooms.position('CODE1', ids[1]!, fix(50))).toEqual([
-      { kind: 'entered', participantId: ids[1], zoneId: 'z1', at: expect.any(String) },
+      { kind: 'entered', participantId: ids[1], zoneId: 'z1', targetName: 'weir again', at: expect.any(String) },
     ]);
     rooms.stop();
   });
@@ -476,6 +490,71 @@ describe('marker reached — once per participant per marker id, ever', () => {
     expect(rooms.position('CODE1', ids[0]!, fix(10))).toEqual([
       { kind: 'reached', participantId: ids[0], markerId: 'mine', at: expect.any(String) },
     ]);
+    rooms.stop();
+  });
+});
+
+describe('event stamping — names survive the roster and the zone', () => {
+  it('stamps actor and zone names at event time, and replay keeps them after both are gone', () => {
+    const rooms = new LiveRooms();
+    const ownerSocket = new FakeSocket();
+    const owner = rooms.join('CODE1', ownerSocket, { owner: true, share: true, expiresAt: soon() });
+    const mover = rooms.join('CODE1', new FakeSocket(), {
+      name: 'Sam',
+      owner: false,
+      share: true,
+      expiresAt: soon(),
+    });
+    if (owner === 'room-full' || mover === 'room-full') throw new Error('unreachable');
+    rooms.zoneCreate('CODE1', owner.id, { id: 'z1', name: 'weir pool', center: fix(0), radiusM: 100 });
+
+    rooms.position('CODE1', mover.id, fix(50));
+    const events = rooms.position('CODE1', mover.id, fix(50));
+    expect(events).toEqual([
+      {
+        kind: 'entered',
+        participantId: mover.id,
+        name: 'Sam',
+        zoneId: 'z1',
+        targetName: 'weir pool',
+        at: expect.any(String),
+      },
+    ]);
+    // The stamp rides the live fanout frame too.
+    expect(ownerSocket.ofType('event').at(-1)!).toMatchObject({ name: 'Sam', targetName: 'weir pool' });
+
+    // Zone deleted, actor's connection gone: the replayed event still names
+    // both — the id alone would resolve to nothing at all.
+    rooms.zoneRemove('CODE1', owner.id, 'z1');
+    rooms.leave('CODE1', mover.id);
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    expect(late.zones).toEqual([]);
+    expect(late.roster.some((entry) => entry.id === mover.id)).toBe(false);
+    expect(late.events.at(-1)!).toMatchObject({ kind: 'entered', name: 'Sam', targetName: 'weir pool' });
+    rooms.stop();
+  });
+
+  it('stamps a named marker on reached; an anonymous actor gets no name key', () => {
+    const { rooms, ids } = roomOf(2); // roomOf joins everyone anonymously
+    rooms.markers('CODE1', ids[0]!, [
+      { id: 'm1', position: fix(0), icon: 'meet', name: 'the bandstand' },
+    ]);
+    rooms.position('CODE1', ids[1]!, fix(10));
+    const reached = rooms.position('CODE1', ids[1]!, fix(10));
+    expect(reached).toEqual([
+      {
+        kind: 'reached',
+        participantId: ids[1],
+        markerId: 'm1',
+        targetName: 'the bandstand',
+        at: expect.any(String),
+      },
+    ]);
+    // Absent means absent — nothing invented for an anonymous actor. (The
+    // unnamed-marker case is pinned by the exact toEqual assertions in the
+    // marker describe above: no targetName key appears there either.)
+    expect('name' in reached[0]!).toBe(false);
     rooms.stop();
   });
 });

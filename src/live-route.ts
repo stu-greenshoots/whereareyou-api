@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { parseLiveClientMessage } from '@whereareyou/protocol';
 import type {
   LiveClientMessage,
+  LiveEvent,
   LiveRefusalReason,
   LiveServerMessage,
   SessionMarker,
@@ -24,9 +25,12 @@ import { PushThrottle, type PushService } from './push.js';
  * every update, so a plain resolve — and the dispatcher console — stays
  * truthful without ever opening a socket. Joiners touch no datastore at all.
  *
- * Push triggers fire from here, throttled per session per kind, and their
- * payloads are generic BY DESIGN: never a position, a zone name, or a chat
- * body — those travel through Apple/Google/Mozilla relays otherwise.
+ * Push triggers fire from here, throttled per session per kind. Payload
+ * privacy basis (revised from "generic by design"): Web Push payloads are
+ * E2E-ENCRYPTED (RFC 8291) — the Apple/Google/Mozilla relays carry
+ * ciphertext they cannot read — so names and short chat snippets may
+ * travel. Precise coordinates never do, as defence-in-depth: a payload's
+ * end state is a lock screen. Actors with no name keep the generic bodies.
  */
 
 /** Silence longer than one missed ping round gets the socket terminated. */
@@ -46,6 +50,9 @@ const HELLO_TIMEOUT_MS = 10_000;
  * those late would duplicate actions, not converge state.
  */
 const TRAILING_TYPES: ReadonlySet<string> = new Set(['position', 'marker', 'markers', 'sketch']);
+
+/** Chat snippet length in a push body — enough to act on, short of a screed. */
+const CHAT_SNIPPET_CHARS = 100;
 
 interface AliveSocket extends WebSocket {
   isAlive?: boolean;
@@ -138,11 +145,31 @@ export async function registerLive(
         socket.close();
       };
 
-      const notify = (kind: string, body: string): void => {
+      /**
+       * `fragment` names the panel the client should open on tap. The url is
+       * RELATIVE on purpose — the service worker resolves it against its own
+       * location, so the GitHub Pages base needs no special-casing here —
+       * and it is the app's session path, the same one shared links use.
+       */
+      const notify = (kind: string, body: string, fragment: 'chat' | 'activity' | 'people'): void => {
         if (push === undefined || code === null) return;
         if (!throttle.allow(code, kind)) return;
         // Fire-and-forget off the hot path; sendToSession never throws.
-        void push.sendToSession(code, { title: 'whereareyou', body });
+        void push.sendToSession(code, {
+          title: 'whereareyou',
+          body,
+          url: `lookup?code=${code}#${fragment}`,
+        });
+      };
+
+      /** '<Name> entered <Zone>' and kin; a nameless actor stays generic. */
+      const eventBody = (event: LiveEvent): string => {
+        if (event.name === undefined || event.targetName === undefined) {
+          return 'Activity on your share.';
+        }
+        return event.kind === 'reached'
+          ? `${event.name} reached ${event.targetName}`
+          : `${event.name} ${event.kind} ${event.targetName}`;
       };
 
       const helloTimer = setTimeout(() => socket.close(), HELLO_TIMEOUT_MS);
@@ -207,7 +234,15 @@ export async function registerLive(
             socket.send(JSON.stringify(welcome));
             // Someone arriving on the owner's share is worth a heads-up; the
             // owner's own hello is not news to them.
-            if (!isOwner) notify('joined', 'Someone joined your share.');
+            if (!isOwner) {
+              notify(
+                'joined',
+                message.name !== undefined
+                  ? `${message.name} joined your share`
+                  : 'Someone joined your share.',
+                'people',
+              );
+            }
             return;
           }
 
@@ -235,9 +270,10 @@ export async function registerLive(
 
           if (message.type === 'position') {
             const events = rooms.position(code, participantId, message.position);
-            // Generic by design: the payload says something happened, never
-            // what or where.
-            if (events.length > 0) notify('event', 'Activity on your share.');
+            // Named when the event is (payloads are E2E-encrypted — header);
+            // never a coordinate. One event describes the burst: the per-kind
+            // throttle would swallow the rest anyway.
+            if (events.length > 0) notify('event', eventBody(events[0]!), 'activity');
             // The owner's pin is the session — keep the record truthful for
             // anyone resolving without a socket. Never extends the TTL.
             if (isOwner) {
@@ -279,7 +315,17 @@ export async function registerLive(
 
           if (message.type === 'chat') {
             const sent = rooms.chat(code, participantId, message.text);
-            if (sent !== undefined) notify('chat', 'New message on your share.');
+            if (sent !== undefined) {
+              const snippet =
+                sent.text.length > CHAT_SNIPPET_CHARS
+                  ? `${sent.text.slice(0, CHAT_SNIPPET_CHARS)}…`
+                  : sent.text;
+              notify(
+                'chat',
+                sent.name !== undefined ? `${sent.name}: ${snippet}` : 'New message on your share.',
+                'chat',
+              );
+            }
             return;
           }
 

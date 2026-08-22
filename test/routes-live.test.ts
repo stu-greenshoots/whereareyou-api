@@ -487,12 +487,13 @@ describe('push triggers', () => {
   function buildPush() {
     const push = new PushService(new MemoryPushStore());
     const spy = vi.spyOn(push, 'sendToSession').mockResolvedValue();
-    const bodies = () => spy.mock.calls.map((call) => (call[1] as { body: string }).body);
-    return { push, spy, bodies };
+    const payloads = () =>
+      spy.mock.calls.map((call) => call[1] as { title: string; body: string; url?: string });
+    return { push, spy, payloads };
   }
 
-  it("pushes on a join and a chat — never on the owner's own hello, once per kind per window", async () => {
-    const { push, spy, bodies } = buildPush();
+  it("pushes rich deep-linked payloads on a join and a chat — never on the owner's own hello, once per kind per window", async () => {
+    const { push, spy, payloads } = buildPush();
     const { app, url, track } = await build(push);
     const { code, updateToken } = await mintLive(app);
 
@@ -505,32 +506,39 @@ describe('push triggers', () => {
     track(friend);
     await joined(friend, { code, name: 'Sam' });
     await owner.next(); // arrival
-    expect(bodies()).toEqual(['Someone joined your share.']);
+    expect(payloads()).toEqual([
+      { title: 'whereareyou', body: 'Sam joined your share', url: `lookup?code=${code}#people` },
+    ]);
 
     // A second joiner inside the window is throttled into silence.
     const another = await TestClient.open(url(code));
     track(another);
     await joined(another, { code });
     await owner.next();
-    expect(bodies()).toEqual(['Someone joined your share.']);
+    expect(spy).toHaveBeenCalledTimes(1);
 
     friend.send({ type: 'chat', text: 'up by the bridge' });
     await owner.next(); // the chat fanout
-    expect(bodies()).toEqual(['Someone joined your share.', 'New message on your share.']);
+    expect(payloads().at(-1)).toEqual({
+      title: 'whereareyou',
+      body: 'Sam: up by the bridge',
+      url: `lookup?code=${code}#chat`,
+    });
 
-    // Generic BY DESIGN: no payload ever carries what was said or where.
+    // Payloads are E2E-encrypted (RFC 8291), so names and snippets may
+    // travel — precise coordinates still never do, as defence-in-depth.
     for (const call of spy.mock.calls) {
-      expect(JSON.stringify(call[1])).not.toContain('bridge');
+      expect(JSON.stringify(call[1])).not.toContain('51.5');
     }
   });
 
-  it('pushes generically on a detection event', async () => {
-    const { push, spy, bodies } = buildPush();
+  it('keeps the generic bodies for nameless actors, deep links intact', async () => {
+    const { push, payloads } = buildPush();
     const { app, url, track } = await build(push);
     const { code, updateToken } = await mintLive(app);
     const owner = await TestClient.open(url(code));
     track(owner);
-    await joined(owner, { code, updateToken });
+    await joined(owner, { code, updateToken }); // anonymous owner
 
     owner.send({
       type: 'zone-create',
@@ -548,12 +556,78 @@ describe('push triggers', () => {
     await owner.next(); // participant echo
     expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
 
-    expect(bodies()).toContain('Activity on your share.');
-    // Payloads carry THAT something happened, never what or where.
-    for (const call of spy.mock.calls) {
-      const payload = JSON.stringify(call[1]);
-      expect(payload).not.toContain('weir');
-      expect(payload).not.toContain('51.5');
-    }
+    // A nameless actor keeps the generic body — so the zone name stays out
+    // of this payload too; the deep link still lands on the activity panel.
+    expect(payloads().at(-1)).toEqual({
+      title: 'whereareyou',
+      body: 'Activity on your share.',
+      url: `lookup?code=${code}#activity`,
+    });
+
+    owner.send({ type: 'chat', text: 'still here' });
+    await owner.next(); // the chat fanout
+    expect(payloads().at(-1)).toEqual({
+      title: 'whereareyou',
+      body: 'New message on your share.',
+      url: `lookup?code=${code}#chat`,
+    });
+  }, 10_000);
+
+  it('names the detection push after its actor and zone, with the activity deep link', async () => {
+    const { push, payloads } = buildPush();
+    const { app, url, track } = await build(push);
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await owner.next(); // arrival
+
+    owner.send({
+      type: 'zone-create',
+      id: 'z1',
+      name: 'weir pool',
+      center: { lat: 51.5, lon: -0.1, accuracyM: 5 },
+      radiusM: 250,
+    });
+    await owner.next(); // zone-created echo
+
+    friend.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant fanout — one inside fix is not an event
+    await sleep(1100); // past the per-type message floor
+    friend.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant fanout
+    expect(await owner.next()).toMatchObject({
+      type: 'event',
+      kind: 'entered',
+      name: 'Sam',
+      targetName: 'weir pool',
+    });
+
+    expect(payloads().at(-1)).toEqual({
+      title: 'whereareyou',
+      body: 'Sam entered weir pool',
+      url: `lookup?code=${code}#activity`,
+    });
+  }, 10_000);
+
+  it('truncates the chat snippet at 100 chars with an ellipsis', async () => {
+    const { push, payloads } = buildPush();
+    const { app, url, track } = await build(push);
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    owner.send({ type: 'chat', text: 'x'.repeat(300) });
+    await owner.next(); // the fanout echo
+    expect(payloads().at(-1)).toEqual({
+      title: 'whereareyou',
+      body: `Stu: ${'x'.repeat(100)}…`,
+      url: `lookup?code=${code}#chat`,
+    });
   });
 });

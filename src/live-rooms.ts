@@ -348,13 +348,22 @@ export class LiveRooms {
     return created;
   }
 
-  /** Remove a zone — any participant may (POC posture). Unknown id: silence. */
+  /**
+   * Remove a zone — honoured only for the zone's CREATOR (matched by
+   * same-connection participantId, the best stable identity this wire has;
+   * an anonymous creator who reconnects therefore loses remove rights on
+   * their own zone — stated plainly, POC-honest) or the session OWNER.
+   * Anything else is silence: unknown id or unauthorised remover alike get
+   * no frame and no error, deliberately indistinguishable. Supersedes the
+   * original any-participant POC posture.
+   */
   zoneRemove(code: string, id: string, zoneId: string): void {
     const room = this.#rooms.get(code);
     const member = room?.members.get(id);
     if (room === undefined || member === undefined) return;
     const index = room.zones.findIndex((zone) => zone.id === zoneId);
     if (index === -1) return;
+    if (room.zones[index]!.createdBy !== id && !member.state.owner) return;
     room.zones.splice(index, 1);
     // Removing a zone discards its detection state; no synthetic 'left'.
     for (const other of room.members.values()) other.zoneState.delete(zoneId);
@@ -419,6 +428,10 @@ export class LiveRooms {
     const events: LiveEvent[] = [];
     const at = new Date().toISOString();
     const participantId = member.state.id;
+    // The actor's display name AT EVENT TIME, stamped for the same reason
+    // chat stamps it: ids are per-connection, and replayed history outlives
+    // both the roster entry and the zone. Anonymous actor: stamp nothing.
+    const actor = member.state.name !== undefined ? { name: member.state.name } : {};
 
     for (const zone of room.zones) {
       const distance = distanceM(fix, zone.center);
@@ -431,14 +444,14 @@ export class LiveRooms {
         if (distance > zone.radiusM + Math.max(fix.accuracyM, ZONE_LEAVE_SLACK_M)) {
           state.inside = false;
           state.streak = 0;
-          events.push({ kind: 'left', participantId, zoneId: zone.id, at });
+          events.push({ kind: 'left', participantId, ...actor, zoneId: zone.id, targetName: zone.name, at });
         }
         // Inside the slack band: still inside. That is the hysteresis.
       } else if (distance < zone.radiusM) {
         state.streak += 1;
         if (state.streak >= ZONE_ENTER_CONSECUTIVE_FIXES) {
           state.inside = true;
-          events.push({ kind: 'entered', participantId, zoneId: zone.id, at });
+          events.push({ kind: 'entered', participantId, ...actor, zoneId: zone.id, targetName: zone.name, at });
         }
       } else {
         state.streak = 0; // an outside fix breaks the consecutive run
@@ -456,7 +469,15 @@ export class LiveRooms {
           if (streak >= ZONE_ENTER_CONSECUTIVE_FIXES) {
             member.markerStreaks.delete(marker.id);
             member.reached.add(marker.id);
-            events.push({ kind: 'reached', participantId, markerId: marker.id, at });
+            events.push({
+              kind: 'reached',
+              participantId,
+              ...actor,
+              markerId: marker.id,
+              // An unnamed marker stamps nothing — never invent a label here.
+              ...(marker.name !== undefined ? { targetName: marker.name } : {}),
+              at,
+            });
           } else {
             member.markerStreaks.set(marker.id, streak);
           }
