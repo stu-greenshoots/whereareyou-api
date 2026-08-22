@@ -6,6 +6,7 @@ import type { WebSocket } from 'ws';
 import { tokensMatch } from './routes.js';
 import type { SessionStore } from './store.js';
 import type { LiveRooms } from './live-rooms.js';
+import type { PushService } from './push.js';
 
 /**
  * The WebSocket end of live rooms: GET /v1/sessions/:code/live upgrades, the
@@ -57,6 +58,7 @@ export async function registerLive(
   app: FastifyInstance,
   store: SessionStore,
   rooms: LiveRooms,
+  push?: PushService,
 ): Promise<void> {
   await app.register(websocket);
 
@@ -145,6 +147,11 @@ export async function registerLive(
 
             code = message.code;
             participantId = result.id;
+            // Where the room arms its expiry timer, the T-minus-5-minutes
+            // push warning is armed alongside (re-arming on every join is
+            // idempotent). In-process timer — see armExpiryWarning for the
+            // honest statement of what a restart loses.
+            push?.armExpiryWarning(message.code, session.expiresAt);
             request.log.info(
               { event: 'live.joined', code, participantId, owner: isOwner, share: message.share },
               'joined live room',

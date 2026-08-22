@@ -41,6 +41,14 @@ export interface Config {
    */
   redisUrl: string | undefined;
   rateLimit: RateLimitConfig;
+  /**
+   * VAPID keys for Web Push. Optional on purpose: when both are absent, a
+   * pair is generated on first need and persisted in the store, so no deploy
+   * config is required. When present, the environment always wins. Values are
+   * key material — they must never be logged or written to the repo.
+   */
+  vapidPublicKey?: string | undefined;
+  vapidPrivateKey?: string | undefined;
 }
 
 export interface RateLimitConfig {
@@ -163,5 +171,9 @@ export function loadConfig(): Config {
     corsOrigins: (process.env['CORS_ORIGINS'] ?? '*').split(',').map((o) => o.trim()),
     redisUrl: process.env['REDIS_URL'] === '' ? undefined : process.env['REDIS_URL'],
     rateLimit: loadRateLimit(),
+    vapidPublicKey:
+      process.env['VAPID_PUBLIC_KEY'] === '' ? undefined : process.env['VAPID_PUBLIC_KEY'],
+    vapidPrivateKey:
+      process.env['VAPID_PRIVATE_KEY'] === '' ? undefined : process.env['VAPID_PRIVATE_KEY'],
   };
 }

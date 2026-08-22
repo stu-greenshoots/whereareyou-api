@@ -25,6 +25,17 @@ export interface SessionStore {
   get(code: string): Promise<StoredSession | undefined>;
   update(code: string, patch: Partial<StoredSession>): Promise<boolean>;
   delete(code: string): Promise<boolean>;
+  /**
+   * Move the session's expiry to a new, later moment.
+   *
+   * The one sanctioned exception to "writes never extend the TTL": `update()`
+   * keeps that rule so a live session cannot become immortal by moving, and
+   * this method exists so the OWNER can deliberately buy more time. The caller
+   * (the extend route) owns the caps; the store just applies the new expiry.
+   */
+  extend(code: string, expiresAt: number): Promise<boolean>;
+  /** Remaining lifetime in milliseconds, or a negative number if the record is gone. */
+  ttlMs(code: string): Promise<number>;
   /** Live session count. Used by /health to sanity-check the enumeration maths. */
   size(): Promise<number>;
 }
@@ -84,6 +95,19 @@ export class MemorySessionStore implements SessionStore {
 
   async delete(code: string): Promise<boolean> {
     return this.#sessions.delete(code);
+  }
+
+  async extend(code: string, expiresAt: number): Promise<boolean> {
+    const session = await this.get(code);
+    if (session === undefined) return false;
+    this.#sessions.set(code, { ...session, expiresAt });
+    return true;
+  }
+
+  async ttlMs(code: string): Promise<number> {
+    const session = await this.get(code);
+    // -2 mirrors Redis PTTL's "no such key", so callers can treat both stores alike.
+    return session === undefined ? -2 : session.expiresAt - Date.now();
   }
 
   async size(): Promise<number> {

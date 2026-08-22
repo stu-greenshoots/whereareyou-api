@@ -50,13 +50,13 @@ describe('LiveRooms', () => {
     const watcher = rooms.join('CODE1', b, { owner: false, share: false, expiresAt: soon() });
     if (sharer === 'room-full' || watcher === 'room-full') throw new Error('unreachable');
 
-    rooms.position('CODE1', sharer.id, { lat: 51.5, lon: -0.1, accuracyM: 8 });
+    rooms.position('CODE1', sharer.id, { lat: 51.5, lon: -0.1, accuracyM: 8, source: 'gnss', takenAt: new Date().toISOString() });
     expect(b.ofType('participant').at(-1)!['participant']).toMatchObject({
       position: { lat: 51.5, lon: -0.1, accuracyM: 8 },
     });
 
     const before = a.sent.length;
-    rooms.position('CODE1', watcher.id, { lat: 0, lon: 0, accuracyM: 5 });
+    rooms.position('CODE1', watcher.id, { lat: 0, lon: 0, accuracyM: 5, source: 'gnss', takenAt: new Date().toISOString() });
     // They said they would not share; a position from them is not honoured.
     expect(a.sent.length).toBe(before);
     rooms.stop();
@@ -90,7 +90,7 @@ describe('LiveRooms', () => {
 
     // Even a watcher's marker counts — placing a point is a statement about
     // the world, not about where you are.
-    rooms.marker('CODE1', first.id, { lat: 51.5, lon: -0.1, accuracyM: 10 });
+    rooms.marker('CODE1', first.id, { lat: 51.5, lon: -0.1, accuracyM: 10, source: 'manual', takenAt: new Date().toISOString() });
     const placed = b.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
     expect(placed['marker']).toMatchObject({ lat: 51.5 });
     expect('position' in placed).toBe(false);
@@ -136,7 +136,7 @@ describe('LiveRooms', () => {
     if (first === 'room-full' || second === 'room-full') throw new Error('unreachable');
 
     dead.closed = true; // send() now throws
-    rooms.position('CODE1', second.id, { lat: 1, lon: 1, accuracyM: 5 });
+    rooms.position('CODE1', second.id, { lat: 1, lon: 1, accuracyM: 5, source: 'gnss', takenAt: new Date().toISOString() });
     // The broadcast reached everyone it could and nothing blew up.
     expect(rooms.size('CODE1')).toBe(2);
     rooms.stop();

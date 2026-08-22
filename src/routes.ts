@@ -13,6 +13,8 @@ import {
   type ResolvedSession,
 } from '@whereareyou/protocol';
 import type { Config } from './config.js';
+import type { LiveRooms } from './live-rooms.js';
+import type { PushService } from './push.js';
 import type { RateLimitDecision, RateLimiter, RateSource } from './rate-limit.js';
 import type { SessionStore, StoredSession } from './store.js';
 
@@ -137,7 +139,16 @@ export interface RouteOptions {
   structuralExpiry?: boolean | undefined;
   /** Absent means no enumeration defence — local development only. */
   limiter?: RateLimiter | undefined;
+  /** Live rooms, so a session extension can re-arm an open room's expiry. */
+  rooms?: LiveRooms | undefined;
+  /** Web Push, for the lookup notification and expiry-warning re-arming. */
+  push?: PushService | undefined;
 }
+
+/** Extension guards: per-call bounds, and the hard ceiling on total life. */
+const EXTEND_MIN_MINUTES = 1;
+const EXTEND_MAX_MINUTES = 180;
+const MAX_SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 export function registerRoutes(
   app: FastifyInstance,
@@ -145,7 +156,7 @@ export function registerRoutes(
   store: SessionStore,
   options: RouteOptions = {},
 ): void {
-  const { structuralExpiry = false, limiter } = options;
+  const { structuralExpiry = false, limiter, rooms, push } = options;
 
   app.get('/health', async () => ({
     status: 'ok',
@@ -336,6 +347,16 @@ export function registerRoutes(
       'resolve ok',
     );
 
+    // Tell the sharer their code was looked up. Fire-and-forget off the hot
+    // path (sendToSession never throws), and generic BY DESIGN: no position,
+    // no operator identity, nothing but the fact of the lookup.
+    if (push !== undefined) {
+      void push.sendToSession(parsed.code, {
+        title: 'whereareyou',
+        body: 'An operator has looked up your code.',
+      });
+    }
+
     return reply.send({
       ...toResolved(session),
       ...(claimable ? {} : { warning: 'resolver running in open mode; claiming disabled' }),
@@ -403,6 +424,68 @@ export function registerRoutes(
       updatedAt: Date.now(),
     });
     return reply.status(204).send();
+  });
+
+  // ---- Extend -----------------------------------------------------------
+  app.post<{ Params: { code: string } }>('/v1/sessions/:code/extend', async (request, reply) => {
+    const parsed = parseCode(request.params.code);
+    if (!parsed.ok) return fail(reply, 400, 'invalid-code', `code rejected: ${parsed.reason}`);
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const token = typeof body['updateToken'] === 'string' ? body['updateToken'] : '';
+
+    const session = await store.get(parsed.code);
+    // Wrong token and missing session are indistinguishable from outside,
+    // exactly as on PATCH and DELETE.
+    if (session === undefined || !tokensMatch(token, session.updateTokenHash)) {
+      return fail(reply, 404, 'not-found', 'no session for that code');
+    }
+
+    const addMinutes = body['addMinutes'];
+    if (
+      typeof addMinutes !== 'number' ||
+      !Number.isInteger(addMinutes) ||
+      addMinutes < EXTEND_MIN_MINUTES ||
+      addMinutes > EXTEND_MAX_MINUTES
+    ) {
+      // Outside ProtocolErrorCode — the union has no slot for this yet, and
+      // the account routes already established plain-string errors for
+      // endpoints the protocol does not cover.
+      return reply.status(400).send({
+        error: 'invalid-extend',
+        message: `addMinutes must be an integer between ${EXTEND_MIN_MINUTES} and ${EXTEND_MAX_MINUTES}`,
+      });
+    }
+
+    // Cumulative cap: however many times the owner extends, the session never
+    // lives past 24h from creation. createdAt IS stored, so the ceiling is
+    // anchored there, not at "now". Clamping (rather than erroring) means the
+    // last extension before the ceiling still grants what it can.
+    const cap = session.createdAt + MAX_SESSION_LIFETIME_MS;
+    const expiresAt = Math.min(session.expiresAt + addMinutes * 60_000, cap);
+
+    if (expiresAt > session.expiresAt) {
+      await store.extend(parsed.code, expiresAt);
+      // Every key belonging to the session moves together: the push
+      // subscriptions' TTL follows the session's new remaining lifetime.
+      // (Lengthening a TTL — never a delete.)
+      if (push !== undefined) await push.extendSubscriptions(parsed.code, expiresAt - Date.now());
+    }
+
+    // An open live room learns immediately: its death timer is re-armed and
+    // everyone's countdown is corrected.
+    if (rooms !== undefined && rooms.size(parsed.code) > 0) rooms.extend(parsed.code, expiresAt);
+
+    // Re-arm the T-minus-5 warning against the NEW expiry — an already-armed
+    // timer would otherwise fire five minutes before a moment that no longer
+    // means anything.
+    push?.armExpiryWarning(parsed.code, expiresAt);
+
+    request.log.info(
+      { event: 'session.extended', code: parsed.code, addMinutes },
+      'session extended',
+    );
+    return reply.send({ expiresAt: new Date(expiresAt).toISOString() });
   });
 
   // ---- Revoke -----------------------------------------------------------

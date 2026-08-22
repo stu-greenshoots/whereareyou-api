@@ -122,6 +122,27 @@ export class LiveRooms {
     this.#broadcast(code, { type: 'participant', participant: member.state });
   }
 
+  /**
+   * The session gained time: re-arm the room's scheduled death and tell
+   * everyone the new expiresAt so their countdowns stay truthful.
+   */
+  extend(code: string, expiresAt: number): void {
+    const room = this.#rooms.get(code);
+    if (room === undefined) return;
+    const previous = this.#expiries.get(code);
+    if (previous !== undefined) clearTimeout(previous);
+    const timer = setTimeout(() => this.expire(code), Math.max(0, expiresAt - Date.now()));
+    timer.unref?.();
+    this.#expiries.set(code, timer);
+    // TODO(live-v2): typed once protocol pin refreshed — 'expiry' is not in
+    // LiveServerMessage yet (a protocol release is in flight). Deployed web
+    // clients ignore unknown message types, so broadcasting it early is safe.
+    this.#broadcast(code, {
+      type: 'expiry',
+      expiresAt: new Date(expiresAt).toISOString(),
+    } as unknown as LiveServerMessage);
+  }
+
   /** The session expired: tell everyone plainly, then hang up on them all. */
   expire(code: string): void {
     const room = this.#rooms.get(code);

@@ -12,6 +12,8 @@ import { registerAccountRoutes } from './account-routes.js';
 import { MemoryAccountStore, RedisAccountStore } from './account-store.js';
 import { registerLive } from './live-route.js';
 import { LiveRooms } from './live-rooms.js';
+import { MemoryPushStore, PushService, RedisPushStore } from './push.js';
+import { registerPushRoutes } from './push-routes.js';
 import { createStore, type SelectedStore } from './store-factory.js';
 
 const config = loadConfig();
@@ -30,6 +32,9 @@ const app = Fastify({
         'req.body.currentPassword',
         'req.body.newPassword',
         'req.body.avatar',
+        // A push endpoint URL identifies a person's browser — same discipline
+        // as a position.
+        'req.body.subscription',
       ],
       censor: '[redacted]',
     },
@@ -75,9 +80,23 @@ await app.register(cors, {
   origin: config.corsOrigins.includes('*') ? true : config.corsOrigins,
 });
 
+// Web Push shares the store's Redis for the same reasons everything else
+// does. VAPID keys: env wins when set; otherwise generated on first need and
+// persisted (Redis: the non-expiring `push:vapid` key; memory: per-process).
+const pushStore =
+  selected.redis !== undefined ? new RedisPushStore(selected.redis) : new MemoryPushStore();
+const push = new PushService(pushStore, {
+  publicKey: config.vapidPublicKey,
+  privateKey: config.vapidPrivateKey,
+});
+
+const liveRooms = new LiveRooms();
+
 registerRoutes(app, config, selected.store, {
   structuralExpiry: selected.structuralExpiry,
   limiter,
+  rooms: liveRooms,
+  push,
 });
 
 // Accounts share the session store's Redis; without Redis they fall back to
@@ -87,11 +106,12 @@ const accountStore =
   selected.redis !== undefined ? new RedisAccountStore(selected.redis) : new MemoryAccountStore();
 registerAccountRoutes(app, accountStore, { limiter });
 
-const liveRooms = new LiveRooms();
-await registerLive(app, selected.store, liveRooms);
+registerPushRoutes(app, selected.store, push);
+await registerLive(app, selected.store, liveRooms, push);
 
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, 'shutting down');
+  push.stop();
   await app.close();
   // Closes the shared connection, which the limiter was borrowing.
   await selected.close();

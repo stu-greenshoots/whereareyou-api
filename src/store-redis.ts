@@ -133,8 +133,29 @@ redis.call('HSET', KEYS[1], unpack(ARGV))
 return 1
 `;
 
+/**
+ * Extend a session's life: rewrite the `expiresAt` field and lengthen the TTL,
+ * atomically, and only for a key that still exists. Same reasoning as the
+ * update script — the gap between EXISTS and HSET is exactly wide enough for
+ * the key to expire, and recreating a dead session TTL-less would be the worst
+ * failure this store can have. Note this LENGTHENS a TTL; it never deletes and
+ * never removes one, so the structural-expiry property stands: the record
+ * still cannot outlive its (new) TTL.
+ *
+ * ARGV[1] = new expiresAt (epoch ms, as stored), ARGV[2] = new TTL in ms.
+ */
+const EXTEND_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'expiresAt', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+`;
+
 interface RedisWithCommands extends Redis {
   wayUpdateSession(key: string, ...fields: string[]): Promise<number>;
+  wayExtendSession(key: string, expiresAt: string, ttlMs: string): Promise<number>;
 }
 
 export class RedisSessionStore implements SessionStore {
@@ -142,6 +163,7 @@ export class RedisSessionStore implements SessionStore {
 
   constructor(redis: Redis) {
     redis.defineCommand('wayUpdateSession', { numberOfKeys: 1, lua: UPDATE_SCRIPT });
+    redis.defineCommand('wayExtendSession', { numberOfKeys: 1, lua: EXTEND_SCRIPT });
     this.#redis = redis as RedisWithCommands;
   }
 
@@ -185,6 +207,14 @@ export class RedisSessionStore implements SessionStore {
 
   async delete(code: string): Promise<boolean> {
     return (await this.#redis.del(key(code))) === 1;
+  }
+
+  async extend(code: string, expiresAt: number): Promise<boolean> {
+    const ttlMs = expiresAt - Date.now();
+    if (ttlMs <= 0) return false; // an "extension" into the past is not one
+    return (
+      (await this.#redis.wayExtendSession(key(code), String(expiresAt), String(ttlMs))) === 1
+    );
   }
 
   /**
