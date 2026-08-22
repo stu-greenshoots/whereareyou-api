@@ -569,6 +569,11 @@ export function registerRoutes(
     }
 
     await store.delete(parsed.code);
+    // The room dies with the record: anyone still connected is told plainly
+    // and hung up on. Without this, "Stop sharing" left joiners in a zombie
+    // room, relaying live positions until the original expiry timer fired —
+    // the code 404'd while the tracking quietly continued.
+    if (rooms !== undefined && rooms.size(parsed.code) > 0) rooms.expire(parsed.code);
     request.log.info({ event: 'session.revoked', code: parsed.code }, 'session revoked');
     return reply.status(204).send();
   });

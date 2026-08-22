@@ -45,8 +45,11 @@ const built: {
 async function build(push?: PushService) {
   const app = Fastify({ logger: false });
   const store = new MemorySessionStore();
-  registerRoutes(app, makeConfig(), store);
-  await registerLive(app, store, new LiveRooms(), push);
+  // One LiveRooms shared by the REST routes and the socket route, as in
+  // production — revoke and extend must reach the same rooms the sockets use.
+  const rooms = new LiveRooms();
+  registerRoutes(app, makeConfig(), store, { rooms });
+  await registerLive(app, store, rooms, push);
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') throw new Error('no port');
@@ -293,6 +296,34 @@ describe('live room state', () => {
     await sleep(100);
     expect(friend.closed).toBe(true);
   });
+
+  it('ends the room when the owner revokes the session — no zombie relay', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code });
+    await owner.next(); // arrival
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/sessions/${code}`,
+      payload: { updateToken },
+    });
+    expect(response.statusCode).toBe(204);
+
+    // Everyone still connected is told plainly, then hung up on — "Stop
+    // sharing" must actually stop the room, not leave it relaying positions
+    // until the original expiry timer fires.
+    expect(await friend.next()).toMatchObject({ type: 'expired' });
+    expect(await owner.next()).toMatchObject({ type: 'expired' });
+    await sleep(100);
+    expect(friend.closed).toBe(true);
+    expect(owner.closed).toBe(true);
+  });
 });
 
 describe('live v2 over the wire', () => {
@@ -394,6 +425,62 @@ describe('live v2 over the wire', () => {
     await friend.next(); // fanout
     expect((await store.get(code))!.markers).toEqual([]);
   });
+
+  it('delivers the newest frame of a floored state burst once the window reopens', async () => {
+    const { app, url, store, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code });
+    await owner.next(); // arrival
+
+    // The web UI commits markers twice in one gesture — icon pick, then Done
+    // (which carries the name) — so the second frame lands inside the floor
+    // window. First-frame-wins flooring would strand the room on the unnamed
+    // marker forever; the trailing flush must converge on the newest frame.
+    const spot = { lat: 51.51, lon: -0.13, accuracyM: 5 };
+    owner.send({ type: 'markers', markers: [{ id: 'm1', position: spot, icon: 'water' }] });
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: spot, icon: 'water', name: 'Fountain' }],
+    });
+
+    // The first frame fans out unnamed…
+    const first = (await friend.next()) as {
+      participant: { markers: Array<Record<string, unknown>> };
+    };
+    expect(first.participant.markers[0]).not.toHaveProperty('name');
+    // …and the floored second applies trailing-edge, without a resend.
+    expect(await friend.next()).toMatchObject({
+      type: 'participant',
+      participant: { markers: [{ id: 'm1', name: 'Fountain' }] },
+    });
+    expect((await store.get(code))!.markers).toMatchObject([{ id: 'm1', name: 'Fountain' }]);
+
+    // Latest wins inside a burst: of two floored edits, only the second lands.
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: spot, icon: 'water', name: 'Old fountain' }],
+    });
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: spot, icon: 'water', name: 'Trafalgar fountain' }],
+    });
+    expect(await friend.next()).toMatchObject({
+      type: 'participant',
+      participant: { markers: [{ id: 'm1', name: 'Trafalgar fountain' }] },
+    });
+    await friend.expectNothing(1200); // the superseded edit never surfaces
+
+    // Event-shaped frames stay drop-only: a floored chat is not replayed late.
+    owner.send({ type: 'chat', text: 'first' });
+    owner.send({ type: 'chat', text: 'second' });
+    expect(await friend.next()).toMatchObject({ type: 'chat', text: 'first' });
+    await friend.expectNothing(1200);
+  }, 10_000);
 });
 
 describe('push triggers', () => {

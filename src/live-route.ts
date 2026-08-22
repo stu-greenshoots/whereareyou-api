@@ -1,7 +1,12 @@
 import websocket from '@fastify/websocket';
 import type { FastifyInstance } from 'fastify';
 import { parseLiveClientMessage } from '@whereareyou/protocol';
-import type { LiveRefusalReason, LiveServerMessage, SessionMarker } from '@whereareyou/protocol';
+import type {
+  LiveClientMessage,
+  LiveRefusalReason,
+  LiveServerMessage,
+  SessionMarker,
+} from '@whereareyou/protocol';
 import type { WebSocket } from 'ws';
 import { tokensMatch } from './routes.js';
 import type { SessionStore } from './store.js';
@@ -29,6 +34,18 @@ const PING_INTERVAL_MS = 30_000;
 /** Per-type message floor — drop the excess, never disconnect for it. */
 const MESSAGE_INTERVAL_MS = 1000;
 const HELLO_TIMEOUT_MS = 10_000;
+
+/**
+ * Frame types that REPLACE whole state, where the newest frame is the truth.
+ * For these, flooring must deliver the LATEST frame once the window reopens:
+ * a first-frame-wins drop leaves the room holding stale state forever (the
+ * web UI commits markers on icon-pick and again on Done within the same
+ * second — dropping the second loses the marker's name for everyone but its
+ * author; the last stroke of a sketch burst vanishes the same way).
+ * Event-shaped frames (chat, zone-create/remove) stay drop-only — replaying
+ * those late would duplicate actions, not converge state.
+ */
+const TRAILING_TYPES: ReadonlySet<string> = new Set(['position', 'marker', 'markers', 'sketch']);
 
 interface AliveSocket extends WebSocket {
   isAlive?: boolean;
@@ -85,6 +102,31 @@ export async function registerLive(
         if (now - last < MESSAGE_INTERVAL_MS) return true;
         lastAt.set(type, now);
         return false;
+      };
+
+      // Trailing-edge delivery for state-replacing frames (TRAILING_TYPES):
+      // a floored frame is stashed (latest wins) and applied when the window
+      // reopens, so the room converges on the sender's real state.
+      const pending = new Map<string, LiveClientMessage>();
+      const pendingTimers = new Map<string, NodeJS.Timeout>();
+      let closed = false;
+
+      const deferTrailing = (message: LiveClientMessage, now: number): void => {
+        if (!TRAILING_TYPES.has(message.type)) return;
+        pending.set(message.type, message);
+        if (pendingTimers.has(message.type)) return; // one armed flush per type
+        const wait = Math.max(1, (lastAt.get(message.type) ?? 0) + MESSAGE_INTERVAL_MS - now);
+        const timer = setTimeout(() => {
+          pendingTimers.delete(message.type);
+          const stashed = pending.get(message.type);
+          if (stashed === undefined || closed) return;
+          pending.delete(message.type);
+          const at = Date.now();
+          if (floored(message.type, at)) return; // belt: the window is open by construction
+          void apply(stashed, at);
+        }, wait);
+        timer.unref();
+        pendingTimers.set(message.type, timer);
       };
 
       const refuse = (reason: LiveRefusalReason): void => {
@@ -176,7 +218,20 @@ export async function registerLive(
           rooms.touch(code, participantId);
 
           const now = Date.now();
-          if (floored(message.type, now)) return;
+          if (floored(message.type, now)) {
+            deferTrailing(message, now);
+            return;
+          }
+          // This frame supersedes anything stashed of its type — a deferred
+          // older frame must never apply after a newer one landed.
+          pending.delete(message.type);
+          await apply(message, now);
+        })();
+      });
+
+      /** Post-join frame handling — called on receipt and from a trailing flush. */
+      const apply = async (message: LiveClientMessage, now: number): Promise<void> => {
+        if (closed || code === null || participantId === null || message.type === 'hello') return;
 
           if (message.type === 'position') {
             const events = rooms.position(code, participantId, message.position);
@@ -241,11 +296,14 @@ export async function registerLive(
           if (message.type === 'zone-remove') {
             rooms.zoneRemove(code, participantId, message.id);
           }
-        })();
-      });
+      };
 
       socket.on('close', () => {
         clearTimeout(helloTimer);
+        closed = true;
+        for (const timer of pendingTimers.values()) clearTimeout(timer);
+        pendingTimers.clear();
+        pending.clear();
         if (code !== null && participantId !== null) rooms.leave(code, participantId);
       });
       socket.on('error', () => socket.terminate());
