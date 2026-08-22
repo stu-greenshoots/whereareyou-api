@@ -22,9 +22,18 @@ export interface LiveSocket {
   close(): void;
 }
 
+/**
+ * A participant as this server knows them: the protocol shape plus a small
+ * avatar image. The avatar rides OUTSIDE the protocol types deliberately —
+ * it is an app-level nicety carried by this reference server, validated in
+ * live-route.ts, and a candidate for promotion into the protocol's live
+ * types once its shape settles.
+ */
+export type RoomParticipant = LiveParticipant & { avatar?: string };
+
 interface Member {
   socket: LiveSocket;
-  state: LiveParticipant;
+  state: RoomParticipant;
   share: boolean;
 }
 
@@ -35,8 +44,14 @@ export class LiveRooms {
   join(
     code: string,
     socket: LiveSocket,
-    options: { name?: string | undefined; owner: boolean; share: boolean; expiresAt: number },
-  ): { id: string; roster: LiveParticipant[] } | 'room-full' {
+    options: {
+      name?: string | undefined;
+      avatar?: string | undefined;
+      owner: boolean;
+      share: boolean;
+      expiresAt: number;
+    },
+  ): { id: string; roster: RoomParticipant[] } | 'room-full' {
     let room = this.#rooms.get(code);
     if (room === undefined) {
       room = new Map();
@@ -48,11 +63,12 @@ export class LiveRooms {
     if (room.size >= MAX_ROOM_PARTICIPANTS) return 'room-full';
 
     const id = randomBytes(6).toString('base64url');
-    const state: LiveParticipant = {
+    const state: RoomParticipant = {
       id,
       owner: options.owner,
       updatedAt: new Date().toISOString(),
       ...(options.name !== undefined ? { name: options.name } : {}),
+      ...(options.avatar !== undefined ? { avatar: options.avatar } : {}),
     };
     // The roster the newcomer gets is everyone already here; everyone
     // already here hears about the newcomer instead.

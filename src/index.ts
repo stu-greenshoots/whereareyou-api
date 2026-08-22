@@ -8,6 +8,8 @@ import {
   type RateLimitBackend,
 } from './rate-limit.js';
 import { registerRoutes } from './routes.js';
+import { registerAccountRoutes } from './account-routes.js';
+import { MemoryAccountStore, RedisAccountStore } from './account-store.js';
 import { registerLive } from './live-route.js';
 import { LiveRooms } from './live-rooms.js';
 import { createStore, type SelectedStore } from './store-factory.js';
@@ -20,7 +22,15 @@ const app = Fastify({
     // Coordinates must never reach the logs. Configured before the first route
     // exists rather than retrofitted, because retrofitting is how leaks happen.
     redact: {
-      paths: ['req.body.position', 'res.body.position', 'req.body.updateToken'],
+      paths: [
+        'req.body.position',
+        'res.body.position',
+        'req.body.updateToken',
+        'req.body.password',
+        'req.body.currentPassword',
+        'req.body.newPassword',
+        'req.body.avatar',
+      ],
       censor: '[redacted]',
     },
   },
@@ -70,6 +80,13 @@ registerRoutes(app, config, selected.store, {
   limiter,
 });
 
+// Accounts share the session store's Redis; without Redis they fall back to
+// memory, which for ACCOUNTS is a real loss (sessions are meant to vanish on
+// expiry — saved maps are meant to survive). The startup log says which.
+const accountStore =
+  selected.redis !== undefined ? new RedisAccountStore(selected.redis) : new MemoryAccountStore();
+registerAccountRoutes(app, accountStore, { limiter });
+
 const liveRooms = new LiveRooms();
 await registerLive(app, selected.store, liveRooms);
 
@@ -111,6 +128,13 @@ try {
         "process's heap and are removed by a sweeper, so the bytes linger between sweeps " +
         'and a restart drops every live code. Set REDIS_URL to get the guarantee the ' +
         'protocol documentation describes. Do not run this configuration anywhere real.',
+    );
+  }
+
+  if (selected.redis === undefined) {
+    app.log.warn(
+      'ACCOUNTS=memory — registered accounts and saved maps live in this process and are ' +
+        'lost on restart. Set REDIS_URL for accounts that persist.',
     );
   }
 

@@ -25,6 +25,30 @@ const PING_INTERVAL_MS = 30_000;
 const MESSAGE_INTERVAL_MS = 1000;
 const HELLO_TIMEOUT_MS = 10_000;
 
+/**
+ * The avatar rides in the hello frame OUTSIDE the protocol's message types —
+ * `parseLiveClientMessage` deliberately strips fields it does not know, so it
+ * is re-read from the raw frame here, with its own validation. A POC seam,
+ * marked as such: if the avatar earns its place it moves into the protocol's
+ * hello and this second parse disappears.
+ */
+const AVATAR_MAX_CHARS = 10_240;
+const AVATAR_SHAPE = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
+
+function extractAvatar(raw: string): string | undefined {
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    const avatar = value['avatar'];
+    if (typeof avatar === 'string' && avatar.length <= AVATAR_MAX_CHARS && AVATAR_SHAPE.test(avatar)) {
+      return avatar;
+    }
+  } catch {
+    // The protocol parser already accepted this frame; a re-parse failure
+    // just means no avatar.
+  }
+  return undefined;
+}
+
 interface AliveSocket extends WebSocket {
   isAlive?: boolean;
 }
@@ -112,6 +136,7 @@ export async function registerLive(
 
             const result = rooms.join(message.code, socket, {
               name: message.name,
+              avatar: extractAvatar(data.toString()),
               owner: isOwner,
               share: message.share,
               expiresAt: session.expiresAt,
