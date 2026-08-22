@@ -81,6 +81,19 @@ export class LiveRooms {
     this.#broadcast(code, { type: 'participant', participant: member.state });
   }
 
+  /** A placed point, or null to take it back. Anyone in the room may place one. */
+  marker(code: string, id: string, position: Position | null): void {
+    const member = this.#rooms.get(code)?.get(id);
+    if (member === undefined) return;
+    if (position === null) {
+      const { marker: _cleared, ...rest } = member.state;
+      member.state = { ...rest, updatedAt: new Date().toISOString() };
+    } else {
+      member.state = { ...member.state, marker: position, updatedAt: new Date().toISOString() };
+    }
+    this.#broadcast(code, { type: 'participant', participant: member.state });
+  }
+
   sketch(code: string, id: string, sketch: string): void {
     const member = this.#rooms.get(code)?.get(id);
     if (member === undefined) return;

@@ -71,6 +71,7 @@ export async function registerLive(
       let isOwner = false;
       let lastPositionAt = 0;
       let lastSketchAt = 0;
+      let lastMarkerAt = 0;
 
       const refuse = (reason: LiveRefusalReason): void => {
         try {
@@ -146,6 +147,13 @@ export async function registerLive(
             if (isOwner) {
               await store.update(code, { position: message.position, updatedAt: now });
             }
+            return;
+          }
+
+          if (message.type === 'marker') {
+            if (now - lastMarkerAt < MESSAGE_INTERVAL_MS) return;
+            lastMarkerAt = now;
+            rooms.marker(code, participantId, message.position);
             return;
           }
 

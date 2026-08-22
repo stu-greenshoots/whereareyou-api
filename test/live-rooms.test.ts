@@ -80,6 +80,27 @@ describe('LiveRooms', () => {
     rooms.stop();
   });
 
+  it('places and clears a marker, distinct from position', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const b = new FakeSocket();
+    const first = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon() });
+    rooms.join('CODE1', b, { owner: false, share: false, expiresAt: soon() });
+    if (first === 'room-full') throw new Error('unreachable');
+
+    // Even a watcher's marker counts — placing a point is a statement about
+    // the world, not about where you are.
+    rooms.marker('CODE1', first.id, { lat: 51.5, lon: -0.1, accuracyM: 10 });
+    const placed = b.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    expect(placed['marker']).toMatchObject({ lat: 51.5 });
+    expect('position' in placed).toBe(false);
+
+    rooms.marker('CODE1', first.id, null);
+    const cleared = b.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    expect('marker' in cleared).toBe(false);
+    rooms.stop();
+  });
+
   it('refuses the seventeenth participant', () => {
     const rooms = new LiveRooms();
     for (let i = 0; i < MAX_ROOM_PARTICIPANTS; i++) {
