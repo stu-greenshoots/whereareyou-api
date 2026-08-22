@@ -1,5 +1,5 @@
 import { Redis } from 'ioredis';
-import type { Position, SessionMode, SessionSubject } from '@whereareyou/protocol';
+import type { Position, SessionMarker, SessionMode, SessionSubject } from '@whereareyou/protocol';
 import type { SessionStore, StoredSession } from './store.js';
 
 /**
@@ -57,6 +57,11 @@ function encode(patch: Partial<StoredSession>): string[] {
   put('sketch', patch.sketch);
   put('marker', patch.marker === undefined ? undefined : JSON.stringify(patch.marker));
   put('markerIcon', patch.markerIcon);
+  // The whole list as one JSON field (bounded by MAX_SESSION_MARKERS at the
+  // routes). Written as '[]' on clear: HSET cannot remove a field without a
+  // delete, and an authoritative empty list shadows any lingering legacy
+  // marker fields on read instead.
+  put('markers', patch.markers === undefined ? undefined : JSON.stringify(patch.markers));
   put('createdAt', patch.createdAt?.toString());
   put('updatedAt', patch.updatedAt?.toString());
   put('expiresAt', patch.expiresAt?.toString());
@@ -76,6 +81,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     sketch,
     marker,
     markerIcon,
+    markers,
     createdAt,
     updatedAt,
     expiresAt,
@@ -107,6 +113,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     ...(sketch !== undefined ? { sketch } : {}),
     ...(marker !== undefined ? { marker: JSON.parse(marker) as Position } : {}),
     ...(markerIcon !== undefined ? { markerIcon } : {}),
+    ...(markers !== undefined ? { markers: JSON.parse(markers) as SessionMarker[] } : {}),
     createdAt: Number(createdAt),
     updatedAt: Number(updatedAt),
     expiresAt: Number(expiresAt),

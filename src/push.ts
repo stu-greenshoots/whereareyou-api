@@ -217,6 +217,41 @@ export class RedisPushStore implements PushStore {
   }
 }
 
+/** At most one push per session per trigger kind within this window. */
+export const PUSH_THROTTLE_WINDOW_MS = 60_000;
+
+/**
+ * Per-session, per-trigger-kind push throttle: a busy room must not turn a
+ * phone into a buzzer. In-memory by design and honestly stated: a restart
+ * forgets the history, so the first trigger after a redeploy can push again
+ * sooner than the window promises. Acceptable for the POC.
+ */
+export class PushThrottle {
+  readonly #last = new Map<string, number>();
+  readonly #windowMs: number;
+
+  constructor(windowMs = PUSH_THROTTLE_WINDOW_MS) {
+    this.#windowMs = windowMs;
+  }
+
+  /** True when a push of this kind may go out for this session right now. */
+  allow(code: string, kind: string): boolean {
+    const key = `${code}:${kind}`;
+    const now = Date.now();
+    const last = this.#last.get(key);
+    if (last !== undefined && now - last < this.#windowMs) return false;
+    // Opportunistic pruning keeps the map from growing with dead sessions;
+    // entries are two machine words, so the threshold is generous.
+    if (this.#last.size >= 1024) {
+      for (const [staleKey, at] of this.#last) {
+        if (now - at >= this.#windowMs) this.#last.delete(staleKey);
+      }
+    }
+    this.#last.set(key, now);
+    return true;
+  }
+}
+
 /** The two web-push calls this server makes, injectable so tests never touch the network. */
 export interface WebPushLike {
   generateVAPIDKeys(): VapidKeyPair;

@@ -2,15 +2,20 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
   MARKER_ICONS,
+  MAX_MARKER_NAME_CHARS,
+  MAX_SESSION_MARKERS,
   formatCode,
   generateCode,
+  isValidLiveId,
   isValidSketchPayload,
   parseCode,
   toPhonetic,
   type CreateSessionResponse,
+  type MarkerIcon,
   type Position,
   type ProtocolErrorCode,
   type ResolvedSession,
+  type SessionMarker,
 } from '@whereareyou/protocol';
 import type { Config } from './config.js';
 import type { LiveRooms } from './live-rooms.js';
@@ -66,7 +71,30 @@ function validatePosition(input: unknown): { position: Position } | { error: str
   return { position: { lat, lon, accuracyM, source, takenAt } };
 }
 
+function validIcon(value: unknown): MarkerIcon | undefined {
+  return typeof value === 'string' && (MARKER_ICONS as readonly string[]).includes(value)
+    ? (value as MarkerIcon)
+    : undefined;
+}
+
+/**
+ * A stored session's marker list, whatever era the record is from. Records
+ * written since live v2 carry `markers` (authoritative, possibly `[]` — any
+ * lingering legacy fields are ignored); older records carried only the
+ * single `marker`/`markerIcon` pair, which reads back as a one-entry list
+ * whose id is `legacy`, per the back-compat rule.
+ */
+function sessionMarkers(session: StoredSession): SessionMarker[] {
+  if (session.markers !== undefined) return session.markers;
+  if (session.marker === undefined) return [];
+  return [{ id: 'legacy', position: session.marker, icon: validIcon(session.markerIcon) ?? 'spot' }];
+}
+
 function toResolved(session: StoredSession): ResolvedSession {
+  // The mirror rule: `marker`/`markerIcon` are read-only views of
+  // `markers[0]`, set on every read, never independently stored truth.
+  const markers = sessionMarkers(session);
+  const first = markers[0];
   return {
     code: session.code,
     position: session.position,
@@ -74,13 +102,68 @@ function toResolved(session: StoredSession): ResolvedSession {
     subject: session.subject,
     ...(session.note !== undefined ? { note: session.note } : {}),
     ...(session.sketch !== undefined ? { sketch: session.sketch } : {}),
-    ...(session.marker !== undefined ? { marker: session.marker } : {}),
-    ...(session.markerIcon !== undefined ? { markerIcon: session.markerIcon as never } : {}),
+    ...(first !== undefined
+      ? { markers, marker: first.position, markerIcon: first.icon }
+      : {}),
     createdAt: new Date(session.createdAt).toISOString(),
     updatedAt: new Date(session.updatedAt).toISOString(),
     expiresAt: new Date(session.expiresAt).toISOString(),
     ...(session.claimedBy !== undefined ? { claimedBy: session.claimedBy } : {}),
   };
+}
+
+/**
+ * Validate a REST `markers` payload. Unlike the WebSocket parser (which
+ * rejects the whole frame), the REST rule is the mint's: invalid entries are
+ * dropped silently, duplicates and overflow included — a bad marker must
+ * never cost someone their code. Returns undefined when the field is absent
+ * or not an array at all, so callers can tell "not supplied" from "empty".
+ */
+function validateMarkers(input: unknown): SessionMarker[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const seen = new Set<string>();
+  const markers: SessionMarker[] = [];
+  for (const entry of input) {
+    if (markers.length >= MAX_SESSION_MARKERS) break;
+    if (typeof entry !== 'object' || entry === null) continue;
+    const raw = entry as Record<string, unknown>;
+    const id = raw['id'];
+    if (!isValidLiveId(id) || seen.has(id)) continue;
+    const validated = validatePosition(raw['position']);
+    if ('error' in validated) continue;
+    let name: string | undefined;
+    if (raw['name'] !== undefined) {
+      if (typeof raw['name'] !== 'string') continue;
+      name = raw['name'].trim().slice(0, MAX_MARKER_NAME_CHARS);
+      if (name === '') name = undefined;
+    }
+    seen.add(id);
+    markers.push({
+      id,
+      position: validated.position,
+      icon: validIcon(raw['icon']) ?? 'spot',
+      ...(name !== undefined ? { name } : {}),
+    });
+  }
+  return markers;
+}
+
+/**
+ * The marker fields of a mint or PATCH body, under the back-compat rule: a
+ * body carrying `markers` is authoritative and any `marker`/`markerIcon`
+ * beside it are ignored; a body carrying only the legacy pair becomes a
+ * one-entry list whose id is `legacy`. Undefined means "nothing supplied —
+ * leave stored state alone".
+ */
+function markersFromBody(body: Record<string, unknown>): SessionMarker[] | undefined {
+  const markers = validateMarkers(body['markers']);
+  if (markers !== undefined) return markers;
+  if (body['marker'] === undefined) return undefined;
+  // Legacy single-marker path: validated exactly like a position, dropped
+  // silently when it fails — a bad marker must never cost someone their code.
+  const validated = validatePosition(body['marker']);
+  if ('error' in validated) return undefined;
+  return [{ id: 'legacy', position: validated.position, icon: validIcon(body['markerIcon']) ?? 'spot' }];
 }
 
 /**
@@ -205,18 +288,10 @@ export function registerRoutes(
         ? body['sketch']
         : undefined;
 
-    // The marked spot: validated exactly like a position, dropped silently
-    // when it fails — a bad marker must never cost someone their code.
-    let marker: Position | undefined;
-    if (body['marker'] !== undefined) {
-      const validatedMarker = validatePosition(body['marker']);
-      if (!('error' in validatedMarker)) marker = validatedMarker.position;
-    }
-    const markerIcon =
-      typeof body['markerIcon'] === 'string' &&
-      (MARKER_ICONS as readonly string[]).includes(body['markerIcon'])
-        ? body['markerIcon']
-        : undefined;
+    // The marked spots — the `markers` list, or the legacy single-marker
+    // pair converted to one. Only the list is stored; the legacy fields are
+    // recomputed as mirrors of markers[0] on every read.
+    const markers = markersFromBody(body);
 
     // Retry on the astronomically unlikely collision rather than silently
     // overwriting somebody else's live session.
@@ -238,8 +313,7 @@ export function registerRoutes(
       subject,
       ...(note !== undefined ? { note } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
-      ...(marker !== undefined ? { marker } : {}),
-      ...(markerIcon !== undefined ? { markerIcon } : {}),
+      ...(markers !== undefined && markers.length > 0 ? { markers } : {}),
       createdAt: now,
       updatedAt: now,
       expiresAt: now + ttlSeconds * 1000,
@@ -402,16 +476,10 @@ export function registerRoutes(
         ? body['sketch']
         : undefined;
 
-    let marker: Position | undefined;
-    if (body['marker'] !== undefined) {
-      const validatedMarker = validatePosition(body['marker']);
-      if (!('error' in validatedMarker)) marker = validatedMarker.position;
-    }
-    const markerIcon =
-      typeof body['markerIcon'] === 'string' &&
-      (MARKER_ICONS as readonly string[]).includes(body['markerIcon'])
-        ? body['markerIcon']
-        : undefined;
+    // Markers under the same rule as everywhere: `markers` authoritative
+    // (an empty list clears), the legacy pair converted, absence meaning
+    // "leave the stored list alone".
+    const markers = markersFromBody(body);
 
     // Note: expiresAt is deliberately NOT extended. A live session must not
     // become immortal simply by continuing to move.
@@ -419,8 +487,7 @@ export function registerRoutes(
       ...(position !== undefined ? { position } : {}),
       ...(upgradeToLive ? { mode: 'live' as const } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
-      ...(marker !== undefined ? { marker } : {}),
-      ...(markerIcon !== undefined ? { markerIcon } : {}),
+      ...(markers !== undefined ? { markers } : {}),
       updatedAt: Date.now(),
     });
     return reply.status(204).send();

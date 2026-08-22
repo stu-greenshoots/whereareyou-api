@@ -1,11 +1,12 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { generateCode } from '@whereareyou/protocol';
 import type { Config } from '../src/config.js';
 import { registerRoutes } from '../src/routes.js';
 import { registerLive } from '../src/live-route.js';
 import { LiveRooms } from '../src/live-rooms.js';
+import { MemoryPushStore, PushService } from '../src/push.js';
 import { MemorySessionStore } from '../src/store.js';
 import { makeSession, sleep } from './helpers.js';
 
@@ -34,17 +35,22 @@ function makeConfig(): Config {
   };
 }
 
-const built: { app: FastifyInstance; store: MemorySessionStore; clients: TestClient[] }[] = [];
+const built: {
+  app: FastifyInstance;
+  store: MemorySessionStore;
+  clients: TestClient[];
+  push?: PushService;
+}[] = [];
 
-async function build() {
+async function build(push?: PushService) {
   const app = Fastify({ logger: false });
   const store = new MemorySessionStore();
   registerRoutes(app, makeConfig(), store);
-  await registerLive(app, store, new LiveRooms());
+  await registerLive(app, store, new LiveRooms(), push);
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') throw new Error('no port');
-  const entry = { app, store, clients: [] as TestClient[] };
+  const entry = { app, store, clients: [] as TestClient[], ...(push !== undefined ? { push } : {}) };
   built.push(entry);
   return {
     app,
@@ -55,10 +61,11 @@ async function build() {
 }
 
 afterEach(async () => {
-  for (const { app, store, clients } of built.splice(0)) {
+  for (const { app, store, clients, push } of built.splice(0)) {
     for (const client of clients) client.dispose();
     await app.close();
     store.stop();
+    push?.stop();
   }
 });
 
@@ -285,5 +292,181 @@ describe('live room state', () => {
     expect(ending).toMatchObject({ type: 'expired' });
     await sleep(100);
     expect(friend.closed).toBe(true);
+  });
+});
+
+describe('live v2 over the wire', () => {
+  const AVATAR = 'data:image/png;base64,AAAA';
+
+  it('carries a typed avatar through hello, and drops junk without costing the join', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, avatar: AVATAR });
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    // The avatar arrives in the roster via the protocol types — the raw-frame
+    // re-parse seam is gone, so this is the parser's own field or nothing.
+    const welcome = await joined(friend, { code, name: 'Sam', avatar: 'javascript:alert(1)' });
+    expect(welcome['roster']).toMatchObject([{ owner: true, avatar: AVATAR }]);
+
+    // Junk avatar: dropped silently, join intact, nothing fanned out.
+    const arrival = await owner.next();
+    const sam = arrival['participant'] as Record<string, unknown>;
+    expect(sam['name']).toBe('Sam');
+    expect('avatar' in sam).toBe(false);
+  });
+
+  it('welcomes a late joiner with retained chat, zones, events and a rich roster', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    owner.send({ type: 'chat', text: 'by the weir' });
+    const chatEcho = await owner.next(); // chat fans back to the sender too
+    expect(chatEcho).toMatchObject({ type: 'chat', text: 'by the weir' });
+    owner.send({
+      type: 'zone-create',
+      id: 'z1',
+      name: 'weir pool',
+      center: { lat: 51.5, lon: -0.1, accuracyM: 5 },
+      radiusM: 250,
+    });
+    expect(await owner.next()).toMatchObject({ type: 'zone-created', zone: { id: 'z1' } });
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: { lat: 51.501, lon: -0.1, accuracyM: 5 }, icon: 'tent' }],
+    });
+    await owner.next(); // own participant echo
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    const welcome = await joined(friend, { code });
+    expect(welcome['chat']).toMatchObject([{ text: 'by the weir' }]);
+    expect(welcome['zones']).toMatchObject([{ id: 'z1', name: 'weir pool', radiusM: 250 }]);
+    expect(welcome['events']).toEqual([]);
+    const roster = welcome['roster'] as Array<Record<string, unknown>>;
+    expect(roster).toHaveLength(1);
+    expect(roster[0]).toMatchObject({
+      name: 'Stu',
+      owner: true,
+      markers: [{ id: 'm1', icon: 'tent' }],
+      // The mirror rule holds in the roster too.
+      markerIcon: 'tent',
+    });
+    expect(typeof roster[0]!['joinedAt']).toBe('string');
+    expect(typeof roster[0]!['lastSeenAt']).toBe('string');
+  });
+
+  it("persists the owner's marker list to the record, and [] clears it — joiners never touch it", async () => {
+    const { app, url, store, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code });
+    await owner.next(); // arrival
+
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: { lat: 51.51, lon: -0.13, accuracyM: 5 }, icon: 'water' }],
+    });
+    await friend.next(); // fanout
+    expect((await store.get(code))!.markers).toMatchObject([{ id: 'm1', icon: 'water' }]);
+
+    // A joiner's markers reach the room, never the datastore.
+    friend.send({
+      type: 'markers',
+      markers: [{ id: 'theirs', position: { lat: 51.52, lon: -0.13, accuracyM: 5 }, icon: 'flag' }],
+    });
+    await owner.next(); // fanout
+    expect((await store.get(code))!.markers).toMatchObject([{ id: 'm1', icon: 'water' }]);
+
+    // The legacy clear empties the stored list too, now the record holds a list.
+    owner.send({ type: 'marker', position: null });
+    await friend.next(); // fanout
+    expect((await store.get(code))!.markers).toEqual([]);
+  });
+});
+
+describe('push triggers', () => {
+  function buildPush() {
+    const push = new PushService(new MemoryPushStore());
+    const spy = vi.spyOn(push, 'sendToSession').mockResolvedValue();
+    const bodies = () => spy.mock.calls.map((call) => (call[1] as { body: string }).body);
+    return { push, spy, bodies };
+  }
+
+  it("pushes on a join and a chat — never on the owner's own hello, once per kind per window", async () => {
+    const { push, spy, bodies } = buildPush();
+    const { app, url, track } = await build(push);
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    expect(spy).not.toHaveBeenCalled(); // your own arrival is not news
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await owner.next(); // arrival
+    expect(bodies()).toEqual(['Someone joined your share.']);
+
+    // A second joiner inside the window is throttled into silence.
+    const another = await TestClient.open(url(code));
+    track(another);
+    await joined(another, { code });
+    await owner.next();
+    expect(bodies()).toEqual(['Someone joined your share.']);
+
+    friend.send({ type: 'chat', text: 'up by the bridge' });
+    await owner.next(); // the chat fanout
+    expect(bodies()).toEqual(['Someone joined your share.', 'New message on your share.']);
+
+    // Generic BY DESIGN: no payload ever carries what was said or where.
+    for (const call of spy.mock.calls) {
+      expect(JSON.stringify(call[1])).not.toContain('bridge');
+    }
+  });
+
+  it('pushes generically on a detection event', async () => {
+    const { push, spy, bodies } = buildPush();
+    const { app, url, track } = await build(push);
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+
+    owner.send({
+      type: 'zone-create',
+      id: 'z1',
+      name: 'weir pool',
+      center: { lat: 51.5, lon: -0.1, accuracyM: 5 },
+      radiusM: 250,
+    });
+    await owner.next(); // zone-created echo
+
+    owner.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant echo — one inside fix is not an event
+    await sleep(1100); // past the per-type message floor
+    owner.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant echo
+    expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
+
+    expect(bodies()).toContain('Activity on your share.');
+    // Payloads carry THAT something happened, never what or where.
+    for (const call of spy.mock.calls) {
+      const payload = JSON.stringify(call[1]);
+      expect(payload).not.toContain('weir');
+      expect(payload).not.toContain('51.5');
+    }
   });
 });

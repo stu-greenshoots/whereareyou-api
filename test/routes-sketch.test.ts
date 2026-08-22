@@ -121,6 +121,127 @@ describe('marker through mint and resolve', () => {
   });
 });
 
+describe('markers through mint, PATCH and resolve — the mirror rule', () => {
+  const spot = (lat: number) => ({ lat, lon: -0.13, accuracyM: 15, source: 'manual' as const });
+
+  interface MarkeredResponse {
+    marker?: { lat: number };
+    markerIcon?: string;
+    markers?: Array<{ id: string; position: { lat: number }; icon: string; name?: string }>;
+  }
+
+  async function mintAndResolve(app: FastifyInstance, extra: Record<string, unknown>) {
+    const minted = await mint(app, extra);
+    expect(minted.statusCode).toBe(201);
+    const { code } = minted.json() as { code: string };
+    return { code, resolved: (await resolve(app, code)).json() as MarkeredResponse };
+  }
+
+  it('returns the minted list plus marker/markerIcon mirroring markers[0]', async () => {
+    const app = build();
+    const { resolved } = await mintAndResolve(app, {
+      markers: [
+        { id: 'camp', position: spot(51.51), icon: 'tent', name: '  base camp  ' },
+        { id: 'water', position: spot(51.52), icon: 'water' },
+      ],
+    });
+    expect(resolved.markers).toHaveLength(2);
+    expect(resolved.markers![0]).toMatchObject({ id: 'camp', icon: 'tent', name: 'base camp' });
+    // The legacy pair is a read-only view of markers[0], nothing else.
+    expect(resolved.marker).toMatchObject({ lat: 51.51 });
+    expect(resolved.markerIcon).toBe('tent');
+  });
+
+  it('reads a legacy single-marker mint back as a one-entry list with id "legacy"', async () => {
+    const app = build();
+    const { resolved } = await mintAndResolve(app, { marker: spot(51.51), markerIcon: 'car' });
+    expect(resolved.markers).toMatchObject([{ id: 'legacy', icon: 'car' }]);
+    expect(resolved.markerIcon).toBe('car');
+
+    // No icon supplied: the marker still stands, as a plain spot.
+    const { resolved: plain } = await mintAndResolve(app, { marker: spot(51.5) });
+    expect(plain.markers).toMatchObject([{ id: 'legacy', icon: 'spot' }]);
+  });
+
+  it('lets markers win over a legacy marker sent beside it — the list is authoritative', async () => {
+    const app = build();
+    const { resolved } = await mintAndResolve(app, {
+      marker: spot(40.0),
+      markerIcon: 'car',
+      markers: [{ id: 'real', position: spot(51.51), icon: 'flag' }],
+    });
+    expect(resolved.markers).toMatchObject([{ id: 'real', icon: 'flag' }]);
+    expect(resolved.marker).toMatchObject({ lat: 51.51 }); // not 40.0
+    expect(resolved.markerIcon).toBe('flag'); // not 'car'
+  });
+
+  it('drops invalid entries, duplicates and overflow silently — never the mint', async () => {
+    const app = build();
+    const { resolved } = await mintAndResolve(app, {
+      markers: [
+        { id: 'bad id!', position: spot(51.5), icon: 'flag' }, // charset
+        { id: 'nopos', position: { lat: 999 }, icon: 'flag' }, // position
+        { id: 'good', position: spot(51.51), icon: 'flag' },
+        { id: 'good', position: spot(51.52), icon: 'tent' }, // duplicate id
+        { id: 'unknown-icon', position: spot(51.53), icon: 'spaceship' }, // → 'spot'
+      ],
+    });
+    expect(resolved.markers).toMatchObject([
+      { id: 'good', icon: 'flag' },
+      { id: 'unknown-icon', icon: 'spot' },
+    ]);
+
+    // 25 valid entries: the first 20 survive, the rest are dropped silently.
+    const many = Array.from({ length: 25 }, (_, i) => ({
+      id: `m${i}`,
+      position: spot(51 + i / 100),
+      icon: 'flag',
+    }));
+    const { resolved: capped } = await mintAndResolve(app, { markers: many });
+    expect(capped.markers).toHaveLength(20);
+    expect(capped.markers!.at(-1)!.id).toBe('m19');
+
+    // A markers field that is not an array at all is ignored wholesale.
+    const { resolved: junk } = await mintAndResolve(app, { markers: 'nonsense' });
+    expect('markers' in junk).toBe(false);
+    expect('marker' in junk).toBe(false);
+  });
+
+  it('replaces the list through PATCH, and clears everything with []', async () => {
+    const app = build();
+    const minted = await mint(app, {
+      mode: 'live',
+      markers: [{ id: 'first', position: spot(51.51), icon: 'tent' }],
+    });
+    const { code, updateToken } = minted.json() as { code: string; updateToken: string };
+
+    const replaced = await app.inject({
+      method: 'PATCH',
+      url: `/v1/sessions/${code}`,
+      payload: {
+        updateToken,
+        position: POSITION,
+        markers: [{ id: 'second', position: spot(51.6), icon: 'water' }],
+      },
+    });
+    expect(replaced.statusCode).toBe(204);
+    const afterReplace = (await resolve(app, code)).json() as MarkeredResponse;
+    expect(afterReplace.markers).toMatchObject([{ id: 'second', icon: 'water' }]);
+    expect(afterReplace.markerIcon).toBe('water');
+
+    const cleared = await app.inject({
+      method: 'PATCH',
+      url: `/v1/sessions/${code}`,
+      payload: { updateToken, position: POSITION, markers: [] },
+    });
+    expect(cleared.statusCode).toBe(204);
+    const afterClear = (await resolve(app, code)).json() as MarkeredResponse;
+    expect('markers' in afterClear).toBe(false);
+    expect('marker' in afterClear).toBe(false);
+    expect('markerIcon' in afterClear).toBe(false);
+  });
+});
+
 describe('sketch through PATCH', () => {
   async function mintLive(app: FastifyInstance, extra: Record<string, unknown> = {}) {
     const minted = await mint(app, { mode: 'live', ...extra });

@@ -3,11 +3,13 @@ import {
   MAX_PUSH_SUBSCRIPTIONS,
   MemoryPushStore,
   PushService,
+  PushThrottle,
   VAPID_SUBJECT,
   parsePushSubscription,
   type PushSubscriptionRecord,
   type WebPushLike,
 } from '../src/push.js';
+import { sleep } from './helpers.js';
 
 /**
  * The push machinery, with web-push replaced by a recorder: VAPID resolution
@@ -216,5 +218,18 @@ describe('PushService.armExpiryWarning', () => {
     await vi.advanceTimersByTimeAsync(36 * 60_000);
     expect(sender.sent).toHaveLength(1);
     service.stop();
+  });
+});
+
+describe('PushThrottle', () => {
+  it('allows one push per session per trigger kind per window — each axis independent', async () => {
+    const throttle = new PushThrottle(60);
+    expect(throttle.allow('CODE1', 'chat')).toBe(true);
+    expect(throttle.allow('CODE1', 'chat')).toBe(false); // same session, same kind
+    expect(throttle.allow('CODE1', 'joined')).toBe(true); // another kind is its own budget
+    expect(throttle.allow('CODE2', 'chat')).toBe(true); // another session too
+
+    await sleep(80); // the window passes
+    expect(throttle.allow('CODE1', 'chat')).toBe(true);
   });
 });

@@ -27,6 +27,9 @@ const app = Fastify({
       paths: [
         'req.body.position',
         'res.body.position',
+        // Marked spots are positions by another name — same discipline.
+        'req.body.marker',
+        'req.body.markers',
         'req.body.updateToken',
         'req.body.password',
         'req.body.currentPassword',

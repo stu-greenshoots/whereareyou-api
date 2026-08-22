@@ -197,6 +197,27 @@ describe.skipIf(!available)('RedisSessionStore', () => {
     expect('sketch' in (await store.get(without.code))!).toBe(false);
   });
 
+  it('round-trips the marker list, including the authoritative empty one', async () => {
+    const session = makeSession({
+      markers: [
+        {
+          id: 'a-1',
+          position: { lat: 51.51, lon: -0.13, accuracyM: 15, source: 'manual', takenAt: new Date().toISOString() },
+          icon: 'tent',
+          name: 'camp',
+        },
+      ],
+    });
+    track(session.code);
+    await store.create(session);
+    expect((await store.get(session.code))!.markers).toEqual(session.markers);
+
+    // Clearing writes '[]' rather than deleting the field: an empty list is
+    // authoritative and shadows any lingering legacy marker fields on read.
+    await store.update(session.code, { markers: [] });
+    expect((await store.get(session.code))!.markers).toEqual([]);
+  });
+
   it('keeps the update token hashed and never stores the plaintext', async () => {
     const session = makeSession({ updateTokenHash: 'b'.repeat(64) });
     track(session.code);

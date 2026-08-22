@@ -1,4 +1,4 @@
-import type { Position, SessionMode, SessionSubject } from '@whereareyou/protocol';
+import type { Position, SessionMarker, SessionMode, SessionSubject } from '@whereareyou/protocol';
 
 export interface StoredSession {
   code: string;
@@ -8,9 +8,17 @@ export interface StoredSession {
   note?: string;
   /** Opaque encoded sketch. Stored and returned verbatim, never parsed here. */
   sketch?: string;
-  /** The spot the sharer marked — not where they are. */
+  /**
+   * LEGACY (pre-live-v2) single marked spot. Only records written before
+   * `markers` existed carry these as stored truth; when `markers` is
+   * present it is authoritative and these are ignored on read. New writes
+   * set `markers` only — the legacy pair is recomputed as a mirror of
+   * `markers[0]` at the response layer, never stored independently.
+   */
   marker?: Position;
   markerIcon?: string;
+  /** All placed markers, ≤ MAX_SESSION_MARKERS. `[]` means cleared. */
+  markers?: SessionMarker[];
   createdAt: number;
   updatedAt: number;
   expiresAt: number;
