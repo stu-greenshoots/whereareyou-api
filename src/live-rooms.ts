@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { MAX_ROOM_PARTICIPANTS } from '@whereareyou/protocol';
-import type { LiveParticipant, LiveServerMessage, Position } from '@whereareyou/protocol';
+import type { LiveParticipant, LiveServerMessage, MarkerIcon, Position } from '@whereareyou/protocol';
 
 /**
  * Live rooms — who is present on a session, in this process's memory.
@@ -82,14 +82,19 @@ export class LiveRooms {
   }
 
   /** A placed point, or null to take it back. Anyone in the room may place one. */
-  marker(code: string, id: string, position: Position | null): void {
+  marker(code: string, id: string, position: Position | null, icon?: MarkerIcon): void {
     const member = this.#rooms.get(code)?.get(id);
     if (member === undefined) return;
     if (position === null) {
-      const { marker: _cleared, ...rest } = member.state;
+      const { marker: _cleared, markerIcon: _icon, ...rest } = member.state;
       member.state = { ...rest, updatedAt: new Date().toISOString() };
     } else {
-      member.state = { ...member.state, marker: position, updatedAt: new Date().toISOString() };
+      member.state = {
+        ...member.state,
+        marker: position,
+        ...(icon !== undefined ? { markerIcon: icon } : {}),
+        updatedAt: new Date().toISOString(),
+      };
     }
     this.#broadcast(code, { type: 'participant', participant: member.state });
   }

@@ -10,6 +10,7 @@ export interface StoredSession {
   sketch?: string;
   /** The spot the sharer marked — not where they are. */
   marker?: Position;
+  markerIcon?: string;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;

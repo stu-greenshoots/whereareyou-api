@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
+  MARKER_ICONS,
   formatCode,
   generateCode,
   isValidSketchPayload,
@@ -72,6 +73,7 @@ function toResolved(session: StoredSession): ResolvedSession {
     ...(session.note !== undefined ? { note: session.note } : {}),
     ...(session.sketch !== undefined ? { sketch: session.sketch } : {}),
     ...(session.marker !== undefined ? { marker: session.marker } : {}),
+    ...(session.markerIcon !== undefined ? { markerIcon: session.markerIcon as never } : {}),
     createdAt: new Date(session.createdAt).toISOString(),
     updatedAt: new Date(session.updatedAt).toISOString(),
     expiresAt: new Date(session.expiresAt).toISOString(),
@@ -199,6 +201,11 @@ export function registerRoutes(
       const validatedMarker = validatePosition(body['marker']);
       if (!('error' in validatedMarker)) marker = validatedMarker.position;
     }
+    const markerIcon =
+      typeof body['markerIcon'] === 'string' &&
+      (MARKER_ICONS as readonly string[]).includes(body['markerIcon'])
+        ? body['markerIcon']
+        : undefined;
 
     // Retry on the astronomically unlikely collision rather than silently
     // overwriting somebody else's live session.
@@ -221,6 +228,7 @@ export function registerRoutes(
       ...(note !== undefined ? { note } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
       ...(marker !== undefined ? { marker } : {}),
+      ...(markerIcon !== undefined ? { markerIcon } : {}),
       createdAt: now,
       updatedAt: now,
       expiresAt: now + ttlSeconds * 1000,
@@ -378,6 +386,11 @@ export function registerRoutes(
       const validatedMarker = validatePosition(body['marker']);
       if (!('error' in validatedMarker)) marker = validatedMarker.position;
     }
+    const markerIcon =
+      typeof body['markerIcon'] === 'string' &&
+      (MARKER_ICONS as readonly string[]).includes(body['markerIcon'])
+        ? body['markerIcon']
+        : undefined;
 
     // Note: expiresAt is deliberately NOT extended. A live session must not
     // become immortal simply by continuing to move.
@@ -386,6 +399,7 @@ export function registerRoutes(
       ...(upgradeToLive ? { mode: 'live' as const } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
       ...(marker !== undefined ? { marker } : {}),
+      ...(markerIcon !== undefined ? { markerIcon } : {}),
       updatedAt: Date.now(),
     });
     return reply.status(204).send();

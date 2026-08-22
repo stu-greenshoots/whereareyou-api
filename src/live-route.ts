@@ -153,12 +153,16 @@ export async function registerLive(
           if (message.type === 'marker') {
             if (now - lastMarkerAt < MESSAGE_INTERVAL_MS) return;
             lastMarkerAt = now;
-            rooms.marker(code, participantId, message.position);
+            rooms.marker(code, participantId, message.position, message.icon);
             // The owner's marked spot persists like their position — but only
             // replacement: the store has no field-delete, so clearing clears
             // the room and the record keeps the last spot (POC seam).
             if (isOwner && message.position !== null) {
-              await store.update(code, { marker: message.position, updatedAt: now });
+              await store.update(code, {
+                marker: message.position,
+                ...(message.icon !== undefined ? { markerIcon: message.icon } : {}),
+                updatedAt: now,
+              });
             }
             return;
           }
