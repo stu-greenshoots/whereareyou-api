@@ -16,15 +16,18 @@
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
+    "@fastify/websocket": "^11.3.0",
     "@whereareyou/protocol": "github:stu-greenshoots/whereareyou-protocol",
     "fastify": "^5.2.0",
     "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "ws": "^8.21.3"
   },
   "engines": {
     "node": ">=20"

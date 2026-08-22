@@ -19,11 +19,11 @@ function fail(reply: FastifyReply, status: number, error: ProtocolErrorCode, mes
   return reply.status(status).send({ error, message });
 }
 
-function hashToken(token: string): string {
+export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function tokensMatch(supplied: string, storedHash: string): boolean {
+export function tokensMatch(supplied: string, storedHash: string): boolean {
   const a = Buffer.from(hashToken(supplied), 'hex');
   const b = Buffer.from(storedHash, 'hex');
   return a.length === b.length && timingSafeEqual(a, b);
@@ -337,12 +337,23 @@ export function registerRoutes(
     if (session === undefined || !tokensMatch(token, session.updateTokenHash)) {
       return fail(reply, 404, 'not-found', 'no session for that code');
     }
-    if (session.mode !== 'live') {
+    // One-way upgrade: the owner can turn a static session live ("make this
+    // a live session"), and never the reverse — a code that was promised to
+    // follow someone must not quietly stop doing so.
+    const upgradeToLive = body['mode'] === 'live' && session.mode !== 'live';
+
+    if (session.mode !== 'live' && !upgradeToLive) {
       return fail(reply, 409, 'not-live', 'session is static and cannot be updated');
     }
 
-    const validated = validatePosition(body['position']);
-    if ('error' in validated) return fail(reply, 400, 'invalid-position', validated.error);
+    // An upgrade-only PATCH may omit the position; anything else keeps the
+    // existing rule that a PATCH is a position update.
+    let position: Position | undefined;
+    if (body['position'] !== undefined || !upgradeToLive) {
+      const validated = validatePosition(body['position']);
+      if ('error' in validated) return fail(reply, 400, 'invalid-position', validated.error);
+      position = validated.position;
+    }
 
     // A replacement sketch may ride a position update — a caller adding an
     // arrow after the code is already out. Same silent-drop rule as minting;
@@ -355,7 +366,8 @@ export function registerRoutes(
     // Note: expiresAt is deliberately NOT extended. A live session must not
     // become immortal simply by continuing to move.
     await store.update(parsed.code, {
-      position: validated.position,
+      ...(position !== undefined ? { position } : {}),
+      ...(upgradeToLive ? { mode: 'live' as const } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
       updatedAt: Date.now(),
     });

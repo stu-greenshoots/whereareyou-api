@@ -8,6 +8,8 @@ import {
   type RateLimitBackend,
 } from './rate-limit.js';
 import { registerRoutes } from './routes.js';
+import { registerLive } from './live-route.js';
+import { LiveRooms } from './live-rooms.js';
 import { createStore, type SelectedStore } from './store-factory.js';
 
 const config = loadConfig();
@@ -67,6 +69,9 @@ registerRoutes(app, config, selected.store, {
   structuralExpiry: selected.structuralExpiry,
   limiter,
 });
+
+const liveRooms = new LiveRooms();
+await registerLive(app, selected.store, liveRooms);
 
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, 'shutting down');
