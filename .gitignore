@@ -5,3 +5,6 @@ dist/
 .env.local
 coverage/
 .DS_Store
+
+# JetBrains IDE
+.idea/
