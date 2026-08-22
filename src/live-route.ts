@@ -23,7 +23,10 @@ import { PushThrottle, type PushService } from './push.js';
  *
  * The OWNER's position, sketch and markers write through to the store on
  * every update, so a plain resolve — and the dispatcher console — stays
- * truthful without ever opening a socket. Joiners touch no datastore at all.
+ * truthful without ever opening a socket. The room's shared memory (zones,
+ * chat, events, reached ids — whoever authored them) also writes through,
+ * so a recreated room rehydrates; a joiner's POSITION still never touches
+ * a datastore.
  *
  * Push triggers fire from here, throttled per session per kind. Payload
  * privacy basis (revised from "generic by design"): Web Push payloads are
@@ -63,10 +66,15 @@ export async function registerLive(
   store: SessionStore,
   rooms: LiveRooms,
   push?: PushService,
+  /** Tests only: shrink the timers so reaps and throttles are observable in ms. */
+  options?: { pingIntervalMs?: number; pushThrottleWindowMs?: number },
 ): Promise<void> {
   await app.register(websocket);
 
-  const throttle = new PushThrottle();
+  const throttle =
+    options?.pushThrottleWindowMs !== undefined
+      ? new PushThrottle(options.pushThrottleWindowMs)
+      : new PushThrottle();
 
   const pinger = setInterval(() => {
     for (const client of app.websocketServer.clients) {
@@ -78,7 +86,7 @@ export async function registerLive(
       socket.isAlive = false;
       socket.ping();
     }
-  }, PING_INTERVAL_MS);
+  }, options?.pingIntervalMs ?? PING_INTERVAL_MS);
   pinger.unref();
 
   app.addHook('onClose', (_instance, done) => {
@@ -134,6 +142,22 @@ export async function registerLive(
         }, wait);
         timer.unref();
         pendingTimers.set(message.type, timer);
+      };
+
+      /**
+       * Write the room's durable state through to the session record, so a
+       * recreated room rehydrates (zones/chat/events/reached — cheap,
+       * low-frequency writes; position fixes and trails stay memory-only by
+       * design). Any participant's chat or zone lands here, not just the
+       * owner's: the room's shared memory belongs to the session. Never
+       * bumps updatedAt — that field vouches for the owner's position, and
+       * someone else chatting must not make the pin look fresher than it is.
+       */
+      const persistLive = async (): Promise<void> => {
+        if (code === null) return;
+        const state = rooms.liveState(code);
+        if (state === undefined) return;
+        await store.update(code, { live: state });
       };
 
       const refuse = (reason: LiveRefusalReason): void => {
@@ -208,6 +232,17 @@ export async function registerLive(
               owner: isOwner,
               share: message.share,
               expiresAt: session.expiresAt,
+              // If this join recreates the room, it comes back remembering:
+              // the persisted zones/chat/events/reached ids, not a blank.
+              hydrate: session.live,
+              // The stable identity this wire has for a non-owner: the hello
+              // name the web re-presents per code on rejoin. No name, no
+              // reusable identity — one shared fallback key, announced once.
+              identity: isOwner
+                ? undefined
+                : message.name !== undefined && message.name !== ''
+                  ? `n:${message.name}`
+                  : 'anon',
             });
             if (result === 'room-full') return refuse('room-full');
 
@@ -232,9 +267,11 @@ export async function registerLive(
               events: result.events,
             };
             socket.send(JSON.stringify(welcome));
-            // Someone arriving on the owner's share is worth a heads-up; the
-            // owner's own hello is not news to them.
-            if (!isOwner) {
+            // Someone arriving on the owner's share is worth a heads-up — the
+            // FIRST time. The owner's own hello is not news to them, and a
+            // reconnect of an already-announced identity (every screen change
+            // on a phone is one) is not news to anyone.
+            if (!isOwner && result.announce) {
               notify(
                 'joined',
                 message.name !== undefined
@@ -243,6 +280,9 @@ export async function registerLive(
                 'people',
               );
             }
+            // The seen-identities set just grew (or the room was recreated
+            // and rehydrated) — keep the record's copy current.
+            await persistLive();
             return;
           }
 
@@ -274,6 +314,10 @@ export async function registerLive(
             // never a coordinate. One event describes the burst: the per-kind
             // throttle would swallow the rest anyway.
             if (events.length > 0) notify('event', eventBody(events[0]!), 'activity');
+            // A detection outcome is durable room memory — the events ring
+            // and any newly-reached marker ids persist; the fix itself never
+            // does (positions and trails are ephemeral by design).
+            if (events.length > 0) await persistLive();
             // The owner's pin is the session — keep the record truthful for
             // anyone resolving without a socket. Never extends the TTL.
             if (isOwner) {
@@ -316,6 +360,7 @@ export async function registerLive(
           if (message.type === 'chat') {
             const sent = rooms.chat(code, participantId, message.text);
             if (sent !== undefined) {
+              await persistLive();
               const snippet =
                 sent.text.length > CHAT_SNIPPET_CHARS
                   ? `${sent.text.slice(0, CHAT_SNIPPET_CHARS)}…`
@@ -330,17 +375,18 @@ export async function registerLive(
           }
 
           if (message.type === 'zone-create') {
-            rooms.zoneCreate(code, participantId, {
+            const created = rooms.zoneCreate(code, participantId, {
               id: message.id,
               name: message.name,
               center: message.center,
               radiusM: message.radiusM,
             });
+            if (created !== undefined) await persistLive();
             return;
           }
 
           if (message.type === 'zone-remove') {
-            rooms.zoneRemove(code, participantId, message.id);
+            if (rooms.zoneRemove(code, participantId, message.id)) await persistLive();
           }
       };
 

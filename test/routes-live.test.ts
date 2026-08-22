@@ -42,14 +42,14 @@ const built: {
   push?: PushService;
 }[] = [];
 
-async function build(push?: PushService) {
+async function build(push?: PushService, options?: { pingIntervalMs?: number }) {
   const app = Fastify({ logger: false });
   const store = new MemorySessionStore();
   // One LiveRooms shared by the REST routes and the socket route, as in
   // production — revoke and extend must reach the same rooms the sockets use.
   const rooms = new LiveRooms();
   registerRoutes(app, makeConfig(), store, { rooms });
-  await registerLive(app, store, rooms, push);
+  await registerLive(app, store, rooms, push, options);
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') throw new Error('no port');
@@ -58,6 +58,7 @@ async function build(push?: PushService) {
   return {
     app,
     store,
+    rooms,
     url: (code: string) => `ws://127.0.0.1:${address.port}/v1/sessions/${code}/live`,
     track: (client: TestClient) => entry.clients.push(client),
   };
@@ -80,9 +81,9 @@ class TestClient {
 
   private constructor(readonly ws: WebSocket) {}
 
-  static open(url: string): Promise<TestClient> {
+  static open(url: string, options?: { autoPong?: boolean }): Promise<TestClient> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, { autoPong: options?.autoPong ?? true });
       const client = new TestClient(ws);
       ws.on('open', () => resolve(client));
       ws.on('error', reject);
@@ -549,9 +550,14 @@ describe('push triggers', () => {
     });
     await owner.next(); // zone-created echo
 
+    // First fix is the silent occupancy baseline — start outside so the
+    // walk in is an OBSERVED transition, per the quiet-reconnect rule.
+    owner.send({ type: 'position', position: { lat: 52.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant echo — the baseline says nothing
+    await sleep(1100); // past the per-type message floor
     owner.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
     await owner.next(); // participant echo — one inside fix is not an event
-    await sleep(1100); // past the per-type message floor
+    await sleep(1100);
     owner.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
     await owner.next(); // participant echo
     expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
@@ -595,9 +601,14 @@ describe('push triggers', () => {
     });
     await owner.next(); // zone-created echo
 
+    // First fix is the silent occupancy baseline — start outside so the
+    // walk in is an OBSERVED transition, per the quiet-reconnect rule.
+    friend.send({ type: 'position', position: { lat: 52.5, lon: -0.1, accuracyM: 5 } });
+    await owner.next(); // participant fanout — the baseline says nothing
+    await sleep(1100); // past the per-type message floor
     friend.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
     await owner.next(); // participant fanout — one inside fix is not an event
-    await sleep(1100); // past the per-type message floor
+    await sleep(1100);
     friend.send({ type: 'position', position: { lat: 51.5, lon: -0.1, accuracyM: 5 } });
     await owner.next(); // participant fanout
     expect(await owner.next()).toMatchObject({
@@ -630,4 +641,326 @@ describe('push triggers', () => {
       url: `lookup?code=${code}#chat`,
     });
   });
+});
+
+describe('one owner per room — supersession and the zombie reaper', () => {
+  it('a second owner connection supersedes the first: kicked, told, gone from rosters', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    const stale = await TestClient.open(url(code));
+    track(stale);
+    const staleWelcome = await joined(stale, { code, updateToken, name: 'Stu' });
+    const staleId = (staleWelcome as { participantId: string }).participantId;
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await stale.next(); // Sam's arrival — a watcher joining kicks nobody
+
+    // The same person again — the live map's socket while the code screen's
+    // headless one is still up (or a zombie of it). Field-observed duplicate.
+    const fresh = await TestClient.open(url(code));
+    track(fresh);
+    const freshWelcome = await joined(fresh, { code, updateToken, name: 'Stu' });
+
+    // The newcomer's roster holds Sam and NO previous owner.
+    expect(freshWelcome['roster']).toMatchObject([{ name: 'Sam', owner: false }]);
+
+    // Sam sees the stale owner leave, then the fresh one arrive.
+    expect(await friend.next()).toMatchObject({ type: 'left', participantId: staleId });
+    expect(await friend.next()).toMatchObject({
+      type: 'participant',
+      participant: { name: 'Stu', owner: true },
+    });
+
+    // The stale connection is hung up on.
+    await vi.waitFor(() => expect(stale.closed).toBe(true));
+  });
+
+  it('a watcher rejoining does not supersede anyone', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    const sam = await TestClient.open(url(code));
+    track(sam);
+    await joined(sam, { code, name: 'Sam' });
+    await owner.next();
+
+    const samAgain = await TestClient.open(url(code));
+    track(samAgain);
+    const welcome = await joined(samAgain, { code, name: 'Sam' });
+    // No identity on the watcher wire, so both Sams stand — the honest POC
+    // posture (superseding same-name joins would let anyone kick anyone).
+    expect((welcome['roster'] as unknown[]).length).toBe(2);
+    expect(sam.closed).toBe(false);
+  });
+
+  it('reaps a member that stops answering pings, with the normal leave fanout', async () => {
+    const { app, url, track } = await build(undefined, { pingIntervalMs: 150 });
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    // A phone whose radio died without a TCP close: the socket answers
+    // nothing, but never says goodbye either.
+    const zombie = await TestClient.open(url(code), { autoPong: false });
+    track(zombie);
+    const zombieWelcome = await joined(zombie, { code, name: 'Ghost' });
+    const zombieId = (zombieWelcome as { participantId: string }).participantId;
+    await owner.next(); // the ghost's arrival
+
+    // Two ping rounds later the server terminates it and everyone hears.
+    expect(await owner.next(3000)).toMatchObject({ type: 'left', participantId: zombieId });
+    await vi.waitFor(() => expect(zombie.closed).toBe(true));
+  });
+});
+
+describe('room state survives the room — persistence and rehydration', () => {
+  it('zones, chat and events outlive the last member leaving, and reached does not re-fire', async () => {
+    const { app, url, store, rooms, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    // A zone (away from the marker so it stays out of the story), a chat
+    // line, a marker, and an arrival at it.
+    owner.send({
+      type: 'zone-create',
+      id: 'z1',
+      name: 'weir',
+      center: { lat: 52.9, lon: -1.9, accuracyM: 5 },
+      radiusM: 100,
+    });
+    expect(await owner.next()).toMatchObject({ type: 'zone-created', zone: { id: 'z1' } });
+
+    owner.send({ type: 'chat', text: 'on my way' });
+    expect(await owner.next()).toMatchObject({ type: 'chat', text: 'on my way' });
+
+    owner.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: POSITION, icon: 'flag', name: 'meet here' }],
+    });
+    await owner.next(); // own fanout
+
+    // Two consecutive fixes at the marker (the enter rule), spaced past the
+    // per-type floor, and 'reached' fires.
+    owner.send({ type: 'position', position: POSITION });
+    await owner.next(); // own participant fanout
+    await sleep(1100);
+    owner.send({ type: 'position', position: POSITION });
+    await owner.next(); // own participant fanout
+    expect(await owner.next()).toMatchObject({ type: 'event', kind: 'reached', markerId: 'm1' });
+
+    // The durable state lands on the session record.
+    await vi.waitFor(async () => {
+      const live = (await store.get(code))!.live;
+      expect(live?.zones).toMatchObject([{ id: 'z1', name: 'weir' }]);
+      expect(live?.chat).toMatchObject([{ text: 'on my way' }]);
+      expect(live?.events).toMatchObject([{ kind: 'reached', markerId: 'm1' }]);
+      expect(live?.reachedMarkerIds).toContain('m1');
+    });
+
+    // Last member leaves; the room is truly gone from memory.
+    owner.ws.close();
+    await vi.waitFor(() => expect(rooms.size(code)).toBe(0));
+
+    // The rejoin — the code screen ↔ live map churn — comes back remembering.
+    const again = await TestClient.open(url(code));
+    track(again);
+    const welcome = await joined(again, { code, updateToken, name: 'Stu' });
+    expect(welcome['zones']).toMatchObject([{ id: 'z1', name: 'weir' }]);
+    expect(welcome['chat']).toMatchObject([{ text: 'on my way' }]);
+    expect(welcome['events']).toMatchObject([{ kind: 'reached', markerId: 'm1' }]);
+
+    // The web replays markers on rejoin; standing at the spot again must
+    // not re-fire the arrival (or the push behind it).
+    again.send({
+      type: 'markers',
+      markers: [{ id: 'm1', position: POSITION, icon: 'flag', name: 'meet here' }],
+    });
+    await again.next(); // own fanout
+    again.send({ type: 'position', position: POSITION });
+    await again.next(); // own participant fanout
+    await sleep(1100);
+    again.send({ type: 'position', position: POSITION });
+    await again.next(); // own participant fanout
+    await sleep(400); // room for a wrong 'event' frame to arrive
+    // Nothing but our own fanouts — drain and prove no event landed.
+    while (true) {
+      let frame: Record<string, unknown>;
+      try {
+        frame = await again.next(200);
+      } catch {
+        break;
+      }
+      expect(frame['type']).not.toBe('event');
+    }
+  }, 20_000);
+
+  it('a room already in memory ignores hydration — live state is the truth', async () => {
+    const { app, url, store, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    // A stale persisted blob (as if from before a deploy) …
+    await store.update(code, {
+      live: { zones: [], chat: [{ id: 'x', participantId: 'gone', text: 'old', at: new Date().toISOString() }], events: [], reachedMarkerIds: [], seenIdentities: [] },
+    });
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    const welcome = await joined(owner, { code, updateToken });
+    // … hydrates the recreated room,
+    expect(welcome['chat']).toMatchObject([{ text: 'old' }]);
+
+    // but a SECOND joiner gets the in-memory room, not a re-read.
+    owner.send({ type: 'chat', text: 'new' });
+    await owner.next();
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    const friendWelcome = await joined(friend, { code });
+    expect(friendWelcome['chat']).toMatchObject([{ text: 'old' }, { text: 'new' }]);
+  });
+});
+
+describe('quiet reconnects — join-once announcements and the silent baseline', () => {
+  function buildPush() {
+    const push = new PushService(new MemoryPushStore());
+    const spy = vi.spyOn(push, 'sendToSession').mockResolvedValue();
+    const payloads = () =>
+      spy.mock.calls.map((call) => call[1] as { title: string; body: string; url?: string });
+    return { push, payloads };
+  }
+
+  it("announces an identity once per session, however often it reconnects", async () => {
+    const { push, payloads } = buildPush();
+    // Throttle disarmed (zero window): what this test proves must be the
+    // seen-identities gate, not the push throttle riding to the rescue.
+    const { app, url, store, rooms, track } = await build(push, { pushThrottleWindowMs: 0 });
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    const joinedBodies = () => payloads().filter((p) => p.body.includes('joined')).map((p) => p.body);
+
+    // Sam churns: join, drop, rejoin, three times over — one announcement.
+    for (let round = 0; round < 3; round += 1) {
+      const sam = await TestClient.open(url(code));
+      track(sam);
+      await joined(sam, { code, name: 'Sam' });
+      await owner.next(); // arrival fanout still flows every time
+      sam.ws.close();
+      expect(await owner.next()).toMatchObject({ type: 'left' });
+    }
+    expect(joinedBodies()).toEqual(['Sam joined your share']);
+
+    // A genuinely new person is still news.
+    const pat = await TestClient.open(url(code));
+    track(pat);
+    await joined(pat, { code, name: 'Pat' });
+    await owner.next();
+    expect(joinedBodies()).toEqual(['Sam joined your share', 'Pat joined your share']);
+
+    // Anonymous hellos share one conservative key: announced once, ever.
+    const anons: TestClient[] = [];
+    for (let round = 0; round < 2; round += 1) {
+      const anon = await TestClient.open(url(code));
+      track(anon);
+      anons.push(anon);
+      await joined(anon, { code });
+      await owner.next();
+    }
+    expect(joinedBodies()).toEqual([
+      'Sam joined your share',
+      'Pat joined your share',
+      'Someone joined your share.',
+    ]);
+
+    // The set survives the room itself: everyone out, room gone, rejoin —
+    // Sam is still not news.
+    for (const client of [owner, pat, ...anons]) client.ws.close();
+    await vi.waitFor(() => expect(rooms.size(code)).toBe(0));
+    await vi.waitFor(async () => {
+      expect((await store.get(code))!.live?.seenIdentities).toContain('n:Sam');
+    });
+    const ownerBack = await TestClient.open(url(code));
+    track(ownerBack);
+    await joined(ownerBack, { code, updateToken, name: 'Stu' });
+    const samBack = await TestClient.open(url(code));
+    track(samBack);
+    await joined(samBack, { code, name: 'Sam' });
+    await ownerBack.next();
+    expect(joinedBodies()).toHaveLength(3);
+  }, 15_000);
+
+  it('seeds zone occupancy silently on rejoin; only real crossings speak', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const inside = POSITION;
+    const outside = { lat: 52.5, lon: -0.1276, accuracyM: 8, source: 'gnss' as const };
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+    owner.send({
+      type: 'zone-create',
+      id: 'z1',
+      name: 'weir',
+      center: { lat: inside.lat, lon: inside.lon, accuracyM: 5 },
+      radiusM: 100,
+    });
+    await owner.next(); // create echo
+
+    // Sam starts outside (the silent baseline) and walks in: one 'entered'.
+    let sam = await TestClient.open(url(code));
+    track(sam);
+    await joined(sam, { code, name: 'Sam' });
+    await owner.next(); // arrival
+    sam.send({ type: 'position', position: outside });
+    await owner.next(); // participant fanout — baseline, silent
+    await sleep(1100);
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant fanout — one inside fix is not an event
+    await sleep(1100);
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant fanout
+    expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
+    sam.ws.close();
+    expect(await owner.next()).toMatchObject({ type: 'left' });
+
+    // Sam reconnects, still inside: the baseline seeds occupancy silently.
+    sam = await TestClient.open(url(code));
+    track(sam);
+    await joined(sam, { code, name: 'Sam' });
+    await owner.next(); // arrival fanout
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant
+    await sleep(1100);
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant
+    await owner.expectNothing(600); // NO re-fired 'entered'
+
+    // A real crossing after the rejoin still speaks — once each way.
+    await sleep(1100);
+    sam.send({ type: 'position', position: outside });
+    await owner.next(); // participant
+    expect(await owner.next()).toMatchObject({ type: 'event', kind: 'left', zoneId: 'z1' });
+    await sleep(1100);
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant
+    await sleep(1100);
+    sam.send({ type: 'position', position: inside });
+    await owner.next(); // participant
+    expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
+  }, 25_000);
 });

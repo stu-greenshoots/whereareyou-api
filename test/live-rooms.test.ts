@@ -363,6 +363,9 @@ describe('zone detection — the hysteresis contract, verbatim', () => {
     const { rooms, sockets, ids } = roomOf(2);
     rooms.zoneCreate('CODE1', ids[0]!, { id: 'z1', name: 'weir', center: fix(0), radiusM: 100 });
 
+    // The FIRST fix seeds occupancy silently (the quiet-reconnect
+    // baseline) — start outside so the walk in is an observed transition.
+    expect(rooms.position('CODE1', ids[1]!, fix(200))).toEqual([]);
     // One inside fix is jitter, not an arrival.
     expect(rooms.position('CODE1', ids[1]!, fix(50))).toEqual([]);
     // An outside fix breaks the run...
@@ -383,6 +386,7 @@ describe('zone detection — the hysteresis contract, verbatim', () => {
   it('leaves only past radius + max(accuracy, slack) — jitter at the boundary is silence', () => {
     const { rooms, ids } = roomOf(2);
     rooms.zoneCreate('CODE1', ids[0]!, { id: 'z1', name: 'weir', center: fix(0), radiusM: 100 });
+    rooms.position('CODE1', ids[1]!, fix(200)); // silent occupancy baseline
     rooms.position('CODE1', ids[1]!, fix(50));
     expect(rooms.position('CODE1', ids[1]!, fix(50))).toHaveLength(1); // entered
 
@@ -508,6 +512,7 @@ describe('event stamping — names survive the roster and the zone', () => {
     if (owner === 'room-full' || mover === 'room-full') throw new Error('unreachable');
     rooms.zoneCreate('CODE1', owner.id, { id: 'z1', name: 'weir pool', center: fix(0), radiusM: 100 });
 
+    rooms.position('CODE1', mover.id, fix(200)); // silent occupancy baseline
     rooms.position('CODE1', mover.id, fix(50));
     const events = rooms.position('CODE1', mover.id, fix(50));
     expect(events).toEqual([

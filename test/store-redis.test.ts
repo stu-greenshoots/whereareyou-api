@@ -253,6 +253,33 @@ describe.skipIf(!available)('RedisSessionStore', () => {
     await store.create(session);
     expect(await store.size()).toBe(before + 1);
   });
+
+  it('persists the live-room blob through update; absence stays absent', async () => {
+    const session = makeSession();
+    track(session.code);
+    await store.create(session);
+    expect('live' in (await store.get(session.code))!).toBe(false);
+
+    const live = {
+      zones: [
+        {
+          id: 'z1',
+          name: 'weir',
+          center: { lat: 52.9, lon: -1.9, accuracyM: 5, source: 'manual' as const },
+          radiusM: 100,
+          createdBy: 'p1',
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      chat: [{ id: 'c1', participantId: 'p1', text: 'on my way', at: new Date().toISOString() }],
+      events: [{ kind: 'reached' as const, participantId: 'p1', markerId: 'm1', at: new Date().toISOString() }],
+      reachedMarkerIds: ['m1'],
+      seenIdentities: ['n:Sam'],
+    };
+    await store.update(session.code, { live });
+    expect((await store.get(session.code))!.live).toEqual(live);
+  });
+
 });
 
 describe('connectRedis', () => {

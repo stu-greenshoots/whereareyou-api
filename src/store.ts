@@ -1,4 +1,18 @@
 import type { Position, SessionMarker, SessionMode, SessionSubject } from '@whereareyou/protocol';
+import type { LiveRoomState } from './live-rooms.js';
+
+/**
+ * `live` is the room's durable state, persisted so a room recreated after
+ * its last member leaves rehydrates instead of forgetting: a solo owner
+ * flipping code screen ↔ live map momentarily empties the room, and the
+ * zones/chat/events they come back to must still be there. Bounded by the
+ * protocol caps (MAX_SESSION_ZONES / MAX_CHAT_HISTORY / MAX_EVENT_HISTORY).
+ * `reachedMarkerIds` is every marker id a 'reached' has ever fired for, so
+ * a rejoin does not re-fire it. INTERNAL ONLY: this field never appears in
+ * any REST response — chat bodies and zone names are user content and the
+ * resolve payload has no business carrying them.
+ */
+export type { LiveRoomState };
 
 export interface StoredSession {
   code: string;
@@ -19,6 +33,8 @@ export interface StoredSession {
   markerIcon?: string;
   /** All placed markers, ≤ MAX_SESSION_MARKERS. `[]` means cleared. */
   markers?: SessionMarker[];
+  /** Live-room durable state (see LiveRoomState). TTL follows the session. */
+  live?: LiveRoomState;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;

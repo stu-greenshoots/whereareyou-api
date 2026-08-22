@@ -33,9 +33,13 @@ import type {
  * accident.
  *
  * Live v2 adds the room's shared memory: a chat ring, named zones, a
- * detection-event ring and per-participant trails. All of it lives here and
- * dies with the session (docs/specs/live-v2-contract.md); loss on a cold
- * start is accepted. None of it may ever reach a log — chat bodies, zone
+ * detection-event ring and per-participant trails. It lives here while the
+ * room does — and the durable part (zones, chat, events, reached ids; never
+ * positions or trails) is written through to the session record by the
+ * route, so a room recreated after its last member leaves rehydrates
+ * instead of forgetting (a solo owner flipping code screen ↔ live map
+ * empties the room in passing). The copy in the record shares the session's
+ * TTL and dies with it. None of it may ever reach a log — chat bodies, zone
  * names, trails and avatars are user content, same discipline as positions.
  *
  * The session TTL still rules everything: a room schedules its own death at
@@ -71,6 +75,14 @@ interface Member {
   markerStreaks: Map<string, number>;
   /** Marker ids this member has reached — at most once each, ever. */
   reached: Set<string>;
+  /**
+   * Whether this member's first honoured fix has seeded zone occupancy.
+   * The seeding is SILENT: a (re)joiner discovered already inside a zone is
+   * state rediscovered, not a transition observed — announcing it made
+   * every screen change on a phone re-fire 'entered' (field report). Events
+   * fire only on transitions seen after the baseline.
+   */
+  baselined: boolean;
 }
 
 interface Room {
@@ -81,6 +93,40 @@ interface Room {
   zones: Zone[];
   /** Retained detection events, oldest first, ≤ MAX_EVENT_HISTORY. */
   events: LiveEvent[];
+  /**
+   * Marker ids 'reached' fired for BEFORE this room instance existed —
+   * hydrated from the session record. Checked alongside each member's own
+   * reached set so a room recreate (solo owner flipping code screen ↔ live
+   * map) does not re-fire the same arrival, and the push with it, on every
+   * rejoin. Deliberate coarseness, stated plainly: after a recreate the
+   * suppression is room-wide, so a DIFFERENT participant arriving at an
+   * already-reached marker fires nothing either. POC-honest — participant
+   * identity does not survive connections, so per-person suppression across
+   * room lifetimes has nothing to key on.
+   */
+  preReached: Set<string>;
+  /** preReached ∪ every id fired this lifetime — what gets persisted. */
+  reachedEver: Set<string>;
+  /**
+   * Announcement keys of every non-owner identity whose arrival has been
+   * announced — `n:<hello name>` (the stable identity the web re-presents
+   * per code on rejoin), or the one shared `anon` key for hellos with no
+   * reusable identity. Persisted, so "X joined your share" fires once per
+   * session per identity, not once per screen change. Two strangers who
+   * share a name collapse to one announcement — conservative in the quiet
+   * direction, stated plainly.
+   */
+  seenIdentities: Set<string>;
+}
+
+/** What a room persists through the session record; see store.ts. */
+export interface LiveRoomState {
+  zones: Zone[];
+  chat: ChatMessage[];
+  events: LiveEvent[];
+  reachedMarkerIds: string[];
+  /** Announcement keys already used — see Room.seenIdentities. */
+  seenIdentities: string[];
 }
 
 /** Everything a welcome needs, straight from the room's retained state. */
@@ -90,9 +136,23 @@ export interface JoinResult {
   chat: ChatMessage[];
   zones: Zone[];
   events: LiveEvent[];
+  /** Whether this arrival is NEWS — an identity not yet announced on this
+      session. False for reconnects of a seen identity; the route keeps the
+      'joined' push behind it. */
+  announce: boolean;
 }
 
 const EARTH_RADIUS_M = 6_371_000;
+
+/**
+ * Hard cap on persisted reached-marker ids: everyone in a full room reaching
+ * everyone's full marker list is the natural ceiling; beyond it something is
+ * feeding us junk and the oldest entries are the ones to shed.
+ */
+const MAX_REACHED_IDS = MAX_ROOM_PARTICIPANTS * MAX_SESSION_MARKERS;
+
+/** Bound on persisted announcement keys; oldest shed first past it. */
+const MAX_SEEN_IDENTITIES = 64;
 
 /**
  * Great-circle distance in metres (haversine). Detection distances are tens
@@ -122,15 +182,62 @@ export class LiveRooms {
       owner: boolean;
       share: boolean;
       expiresAt: number;
+      /**
+       * The session record's persisted room state — used ONLY when this
+       * join creates the room, so zones/chat/events survive the room's
+       * last-member-leaves teardown. A room already in memory is the truth
+       * and hydration is ignored.
+       */
+      hydrate?: LiveRoomState | undefined;
+      /**
+       * Announcement key for a NON-owner join — `n:<name>` or `anon`. The
+       * result's `announce` says whether this key is new to the session
+       * (push the arrival) or already seen (a reconnect: stay quiet).
+       */
+      identity?: string | undefined;
     },
   ): JoinResult | 'room-full' {
     let room = this.#rooms.get(code);
     if (room === undefined) {
-      room = { members: new Map(), chat: [], zones: [], events: [] };
+      const hydrate = options.hydrate;
+      const reached = (hydrate?.reachedMarkerIds ?? []).slice(0, MAX_REACHED_IDS);
+      room = {
+        members: new Map(),
+        chat: (hydrate?.chat ?? []).slice(-MAX_CHAT_HISTORY),
+        zones: (hydrate?.zones ?? []).slice(0, MAX_SESSION_ZONES),
+        events: (hydrate?.events ?? []).slice(-MAX_EVENT_HISTORY),
+        preReached: new Set(reached),
+        reachedEver: new Set(reached),
+        seenIdentities: new Set((hydrate?.seenIdentities ?? []).slice(-MAX_SEEN_IDENTITIES)),
+      };
       this.#rooms.set(code, room);
       const timer = setTimeout(() => this.expire(code), Math.max(0, options.expiresAt - Date.now()));
       timer.unref?.();
       this.#expiries.set(code, timer);
+    }
+    // OWNER SUPERSESSION. A hello that proves the updateToken IS the owner,
+    // and there is exactly one of those per session — so any owner already
+    // in the room is a previous connection of the same person: the code
+    // screen's headless socket whose close is still in flight, a zombie the
+    // heartbeat has not reaped yet, a reconnect after radio churn. Without
+    // this the owner stands in every roster twice (field-observed: "Stu"
+    // and "You", both sharer, distinct join times) until the close lands or
+    // the ping reaper catches up. Supersede: remove, tell the room, hang up.
+    if (options.owner) {
+      for (const [staleId, stale] of [...room.members]) {
+        if (!stale.state.owner) continue;
+        room.members.delete(staleId);
+        this.#discardMarkerState(
+          room,
+          (stale.state.markers ?? []).map((marker) => marker.id),
+        );
+        this.#broadcast(code, { type: 'left', participantId: staleId });
+        try {
+          stale.socket.close();
+        } catch {
+          // A socket that will not close is already gone.
+        }
+      }
     }
     if (room.members.size >= MAX_ROOM_PARTICIPANTS) return 'room-full';
 
@@ -151,12 +258,22 @@ export class LiveRooms {
     const roster = [...room.members.values()].map((member) =>
       member.trail.length > 0 ? { ...member.state, trail: [...member.trail] } : member.state,
     );
+    const identity = options.identity;
+    const announce = identity !== undefined && !room.seenIdentities.has(identity);
+    if (identity !== undefined) {
+      room.seenIdentities.add(identity);
+      if (room.seenIdentities.size > MAX_SEEN_IDENTITIES) {
+        const oldest = room.seenIdentities.values().next().value;
+        if (oldest !== undefined) room.seenIdentities.delete(oldest);
+      }
+    }
     const result: JoinResult = {
       id,
       roster,
       chat: [...room.chat],
       zones: [...room.zones],
       events: [...room.events],
+      announce,
     };
     room.members.set(id, {
       socket,
@@ -166,6 +283,7 @@ export class LiveRooms {
       zoneState: new Map(),
       markerStreaks: new Map(),
       reached: new Set(),
+      baselined: false,
     });
     this.#broadcast(code, { type: 'participant', participant: state }, id);
     return result;
@@ -357,17 +475,35 @@ export class LiveRooms {
    * no frame and no error, deliberately indistinguishable. Supersedes the
    * original any-participant POC posture.
    */
-  zoneRemove(code: string, id: string, zoneId: string): void {
+  zoneRemove(code: string, id: string, zoneId: string): boolean {
     const room = this.#rooms.get(code);
     const member = room?.members.get(id);
-    if (room === undefined || member === undefined) return;
+    if (room === undefined || member === undefined) return false;
     const index = room.zones.findIndex((zone) => zone.id === zoneId);
-    if (index === -1) return;
-    if (room.zones[index]!.createdBy !== id && !member.state.owner) return;
+    if (index === -1) return false;
+    if (room.zones[index]!.createdBy !== id && !member.state.owner) return false;
     room.zones.splice(index, 1);
     // Removing a zone discards its detection state; no synthetic 'left'.
     for (const other of room.members.values()) other.zoneState.delete(zoneId);
     this.#broadcast(code, { type: 'zone-removed', id: zoneId });
+    return true;
+  }
+
+  /**
+   * The room's durable state, for the route to write through to the session
+   * record — bounded copies, safe to serialise. Undefined when no room is
+   * in memory for the code.
+   */
+  liveState(code: string): LiveRoomState | undefined {
+    const room = this.#rooms.get(code);
+    if (room === undefined) return undefined;
+    return {
+      zones: [...room.zones],
+      chat: [...room.chat],
+      events: [...room.events],
+      reachedMarkerIds: [...room.reachedEver].slice(-MAX_REACHED_IDS),
+      seenIdentities: [...room.seenIdentities].slice(-MAX_SEEN_IDENTITIES),
+    };
   }
 
   /**
@@ -428,6 +564,12 @@ export class LiveRooms {
     const events: LiveEvent[] = [];
     const at = new Date().toISOString();
     const participantId = member.state.id;
+    // First honoured fix after (re)join: seed zone occupancy SILENTLY (see
+    // Member.baselined). Markers keep their normal path — 'reached' cannot
+    // fire on a single fix, and already-reached ids are suppressed by the
+    // persisted set, so a baseline exception would add nothing but a hole.
+    const baseline = !member.baselined;
+    member.baselined = true;
     // The actor's display name AT EVENT TIME, stamped for the same reason
     // chat stamps it: ids are per-connection, and replayed history outlives
     // both the roster entry and the zone. Anonymous actor: stamp nothing.
@@ -439,6 +581,11 @@ export class LiveRooms {
       if (state === undefined) {
         state = { streak: 0, inside: false };
         member.zoneState.set(zone.id, state);
+      }
+      if (baseline) {
+        state.inside = distance < zone.radiusM;
+        state.streak = 0;
+        continue; // occupancy rediscovered, never announced
       }
       if (state.inside) {
         if (distance > zone.radiusM + Math.max(fix.accuracyM, ZONE_LEAVE_SLACK_M)) {
@@ -462,13 +609,16 @@ export class LiveRooms {
     // own "meet here" is as much an arrival as anyone else's.
     for (const other of room.members.values()) {
       for (const marker of other.state.markers ?? []) {
-        if (member.reached.has(marker.id)) continue;
+        // A marker already arrived at in an earlier room lifetime stays
+        // arrived at — rehydrated suppression, see Room.preReached.
+        if (member.reached.has(marker.id) || room.preReached.has(marker.id)) continue;
         const effectiveRadius = Math.max(MARKER_REACHED_RADIUS_M, fix.accuracyM);
         if (distanceM(fix, marker.position) < effectiveRadius) {
           const streak = (member.markerStreaks.get(marker.id) ?? 0) + 1;
           if (streak >= ZONE_ENTER_CONSECUTIVE_FIXES) {
             member.markerStreaks.delete(marker.id);
             member.reached.add(marker.id);
+            room.reachedEver.add(marker.id);
             events.push({
               kind: 'reached',
               participantId,

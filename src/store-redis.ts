@@ -1,6 +1,6 @@
 import { Redis } from 'ioredis';
 import type { Position, SessionMarker, SessionMode, SessionSubject } from '@whereareyou/protocol';
-import type { SessionStore, StoredSession } from './store.js';
+import type { LiveRoomState, SessionStore, StoredSession } from './store.js';
 
 /**
  * Redis-backed session store.
@@ -62,6 +62,10 @@ function encode(patch: Partial<StoredSession>): string[] {
   // delete, and an authoritative empty list shadows any lingering legacy
   // marker fields on read instead.
   put('markers', patch.markers === undefined ? undefined : JSON.stringify(patch.markers));
+  // Live-room durable state as one JSON field, bounded upstream by the
+  // protocol caps. Internal only — decoded for room rehydration, never
+  // surfaced by any REST response.
+  put('live', patch.live === undefined ? undefined : JSON.stringify(patch.live));
   put('createdAt', patch.createdAt?.toString());
   put('updatedAt', patch.updatedAt?.toString());
   put('expiresAt', patch.expiresAt?.toString());
@@ -82,6 +86,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     marker,
     markerIcon,
     markers,
+    live,
     createdAt,
     updatedAt,
     expiresAt,
@@ -114,6 +119,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     ...(marker !== undefined ? { marker: JSON.parse(marker) as Position } : {}),
     ...(markerIcon !== undefined ? { markerIcon } : {}),
     ...(markers !== undefined ? { markers: JSON.parse(markers) as SessionMarker[] } : {}),
+    ...(live !== undefined ? { live: JSON.parse(live) as LiveRoomState } : {}),
     createdAt: Number(createdAt),
     updatedAt: Number(updatedAt),
     expiresAt: Number(expiresAt),
