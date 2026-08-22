@@ -102,6 +102,25 @@ describe('sketch through mint and resolve', () => {
   });
 });
 
+describe('marker through mint and resolve', () => {
+  it('returns a minted marker on resolve, and keeps it out when invalid', async () => {
+    const app = build();
+    const marker = { lat: 51.51, lon: -0.13, accuracyM: 15, source: 'manual' as const };
+    const minted = await mint(app, { marker });
+    expect(minted.statusCode).toBe(201);
+    const resolved = (await resolve(app, (minted.json() as { code: string }).code)).json() as {
+      marker?: { lat: number };
+    };
+    expect(resolved.marker).toMatchObject({ lat: 51.51 });
+
+    // A junk marker never costs the mint.
+    const junk = await mint(app, { marker: { lat: 999 } });
+    expect(junk.statusCode).toBe(201);
+    const junkResolved = (await resolve(app, (junk.json() as { code: string }).code)).json() as object;
+    expect('marker' in junkResolved).toBe(false);
+  });
+});
+
 describe('sketch through PATCH', () => {
   async function mintLive(app: FastifyInstance, extra: Record<string, unknown> = {}) {
     const minted = await mint(app, { mode: 'live', ...extra });

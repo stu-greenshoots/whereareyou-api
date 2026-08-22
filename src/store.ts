@@ -8,6 +8,8 @@ export interface StoredSession {
   note?: string;
   /** Opaque encoded sketch. Stored and returned verbatim, never parsed here. */
   sketch?: string;
+  /** The spot the sharer marked — not where they are. */
+  marker?: Position;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;

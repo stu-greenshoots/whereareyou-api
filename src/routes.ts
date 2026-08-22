@@ -71,6 +71,7 @@ function toResolved(session: StoredSession): ResolvedSession {
     subject: session.subject,
     ...(session.note !== undefined ? { note: session.note } : {}),
     ...(session.sketch !== undefined ? { sketch: session.sketch } : {}),
+    ...(session.marker !== undefined ? { marker: session.marker } : {}),
     createdAt: new Date(session.createdAt).toISOString(),
     updatedAt: new Date(session.updatedAt).toISOString(),
     expiresAt: new Date(session.expiresAt).toISOString(),
@@ -191,6 +192,14 @@ export function registerRoutes(
         ? body['sketch']
         : undefined;
 
+    // The marked spot: validated exactly like a position, dropped silently
+    // when it fails — a bad marker must never cost someone their code.
+    let marker: Position | undefined;
+    if (body['marker'] !== undefined) {
+      const validatedMarker = validatePosition(body['marker']);
+      if (!('error' in validatedMarker)) marker = validatedMarker.position;
+    }
+
     // Retry on the astronomically unlikely collision rather than silently
     // overwriting somebody else's live session.
     let code = generateCode();
@@ -211,6 +220,7 @@ export function registerRoutes(
       subject,
       ...(note !== undefined ? { note } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
+      ...(marker !== undefined ? { marker } : {}),
       createdAt: now,
       updatedAt: now,
       expiresAt: now + ttlSeconds * 1000,
@@ -363,12 +373,19 @@ export function registerRoutes(
         ? body['sketch']
         : undefined;
 
+    let marker: Position | undefined;
+    if (body['marker'] !== undefined) {
+      const validatedMarker = validatePosition(body['marker']);
+      if (!('error' in validatedMarker)) marker = validatedMarker.position;
+    }
+
     // Note: expiresAt is deliberately NOT extended. A live session must not
     // become immortal simply by continuing to move.
     await store.update(parsed.code, {
       ...(position !== undefined ? { position } : {}),
       ...(upgradeToLive ? { mode: 'live' as const } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
+      ...(marker !== undefined ? { marker } : {}),
       updatedAt: Date.now(),
     });
     return reply.status(204).send();

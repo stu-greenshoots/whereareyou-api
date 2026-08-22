@@ -55,6 +55,7 @@ function encode(patch: Partial<StoredSession>): string[] {
   put('subject', patch.subject);
   put('note', patch.note);
   put('sketch', patch.sketch);
+  put('marker', patch.marker === undefined ? undefined : JSON.stringify(patch.marker));
   put('createdAt', patch.createdAt?.toString());
   put('updatedAt', patch.updatedAt?.toString());
   put('expiresAt', patch.expiresAt?.toString());
@@ -72,6 +73,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     subject,
     note,
     sketch,
+    marker,
     createdAt,
     updatedAt,
     expiresAt,
@@ -101,6 +103,7 @@ function decode(hash: Record<string, string>): StoredSession | undefined {
     subject: subject as SessionSubject,
     ...(note !== undefined ? { note } : {}),
     ...(sketch !== undefined ? { sketch } : {}),
+    ...(marker !== undefined ? { marker: JSON.parse(marker) as Position } : {}),
     createdAt: Number(createdAt),
     updatedAt: Number(updatedAt),
     expiresAt: Number(expiresAt),
