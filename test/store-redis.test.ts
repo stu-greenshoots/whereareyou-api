@@ -185,6 +185,18 @@ describe.skipIf(!available)('RedisSessionStore', () => {
     expect('claimedBy' in loaded!).toBe(false);
   });
 
+  it('stores a sketch verbatim and omits an absent one', async () => {
+    const withSketch = makeSession({ sketch: 'AeDU9ASfnAEgAADIAQA' });
+    track(withSketch.code);
+    await store.create(withSketch);
+    expect((await store.get(withSketch.code))!.sketch).toBe('AeDU9ASfnAEgAADIAQA');
+
+    const without = makeSession();
+    track(without.code);
+    await store.create(without);
+    expect('sketch' in (await store.get(without.code))!).toBe(false);
+  });
+
   it('keeps the update token hashed and never stores the plaintext', async () => {
     const session = makeSession({ updateTokenHash: 'b'.repeat(64) });
     track(session.code);

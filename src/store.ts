@@ -6,6 +6,8 @@ export interface StoredSession {
   mode: SessionMode;
   subject: SessionSubject;
   note?: string;
+  /** Opaque encoded sketch. Stored and returned verbatim, never parsed here. */
+  sketch?: string;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;

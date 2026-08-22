@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
   formatCode,
   generateCode,
+  isValidSketchPayload,
   parseCode,
   toPhonetic,
   type CreateSessionResponse,
@@ -69,6 +70,7 @@ function toResolved(session: StoredSession): ResolvedSession {
     mode: session.mode,
     subject: session.subject,
     ...(session.note !== undefined ? { note: session.note } : {}),
+    ...(session.sketch !== undefined ? { sketch: session.sketch } : {}),
     createdAt: new Date(session.createdAt).toISOString(),
     updatedAt: new Date(session.updatedAt).toISOString(),
     expiresAt: new Date(session.expiresAt).toISOString(),
@@ -181,6 +183,14 @@ export function registerRoutes(
 
     const note = typeof body['note'] === 'string' ? body['note'].slice(0, 280) : undefined;
 
+    // Accepted only when well-formed — length and charset, never decoded
+    // here — and otherwise dropped silently while the mint proceeds. A
+    // malformed sketch must never cost someone in trouble their code.
+    const sketch =
+      typeof body['sketch'] === 'string' && isValidSketchPayload(body['sketch'])
+        ? body['sketch']
+        : undefined;
+
     // Retry on the astronomically unlikely collision rather than silently
     // overwriting somebody else's live session.
     let code = generateCode();
@@ -200,6 +210,7 @@ export function registerRoutes(
       mode,
       subject,
       ...(note !== undefined ? { note } : {}),
+      ...(sketch !== undefined ? { sketch } : {}),
       createdAt: now,
       updatedAt: now,
       expiresAt: now + ttlSeconds * 1000,
@@ -333,9 +344,21 @@ export function registerRoutes(
     const validated = validatePosition(body['position']);
     if ('error' in validated) return fail(reply, 400, 'invalid-position', validated.error);
 
+    // A replacement sketch may ride a position update — a caller adding an
+    // arrow after the code is already out. Same silent-drop rule as minting;
+    // absent means "leave the stored sketch alone".
+    const sketch =
+      typeof body['sketch'] === 'string' && isValidSketchPayload(body['sketch'])
+        ? body['sketch']
+        : undefined;
+
     // Note: expiresAt is deliberately NOT extended. A live session must not
     // become immortal simply by continuing to move.
-    await store.update(parsed.code, { position: validated.position, updatedAt: Date.now() });
+    await store.update(parsed.code, {
+      position: validated.position,
+      ...(sketch !== undefined ? { sketch } : {}),
+      updatedAt: Date.now(),
+    });
     return reply.status(204).send();
   });
 

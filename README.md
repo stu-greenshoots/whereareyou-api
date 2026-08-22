@@ -22,9 +22,9 @@ curl localhost:8787/health
 
 | | |
 |---|---|
-| `POST /v1/sessions` | Mint. Returns code, display form, phonetic form, expiry, update token |
+| `POST /v1/sessions` | Mint. Returns code, display form, phonetic form, expiry, update token. Accepts an optional opaque `sketch` |
 | `GET /v1/sessions/{code}` | Resolve. Claims the code for the resolving control room |
-| `PATCH /v1/sessions/{code}` | Update position on a live session |
+| `PATCH /v1/sessions/{code}` | Update position on a live session; may carry a replacement sketch |
 | `DELETE /v1/sessions/{code}` | Sharer revokes |
 | `GET /health` | Liveness and live session count |
 
@@ -103,6 +103,13 @@ argument actually rests on. So:
 - **Writes never extend the TTL**, and an update racing its own expiry cannot
   resurrect a session — the patch is a single atomic Lua step, because a plain
   `HSET` against a vanished key would recreate it *with no expiry at all*.
+- **The caller's sketch inherits all of this for free.** "You said you avoid
+  databases of location data — and now you store drawings?" The sketch is one
+  more field of the same `sess:{code}` hash: no key of its own, no second TTL,
+  no sweeper, so the drawing physically cannot outlive the code it rode in on.
+  The server also never parses it — it checks length and charset and stores the
+  string verbatim, so there is nothing here that understands the geometry it is
+  holding.
 - **An unreachable Redis is fatal at startup.** Deliberately no fallback to
   memory: a resolver that silently downgraded would carry on advertising a
   guarantee that had stopped being true, which is worse than one that refuses to

@@ -38,6 +38,17 @@ describe('MemorySessionStore', () => {
     expect(await store.get(session.code)).toBeUndefined();
   });
 
+  it('keeps a sketch, and keeps its absence, distinct', async () => {
+    const store = make();
+    const withSketch = makeSession({ sketch: 'AeDU9ASfnAEgAADIAQA' });
+    await store.create(withSketch);
+    expect((await store.get(withSketch.code))!.sketch).toBe('AeDU9ASfnAEgAADIAQA');
+
+    const without = makeSession();
+    await store.create(without);
+    expect('sketch' in (await store.get(without.code))!).toBe(false);
+  });
+
   it('patches without replacing the whole record', async () => {
     const store = make();
     const session = makeSession();
