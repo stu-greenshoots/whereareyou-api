@@ -287,6 +287,13 @@ export class LiveRooms {
    * is defensively re-capped here even though the wire parser already
    * truncates. Returns the retained message, or undefined when it was
    * dropped — so the route can trigger a push on real messages only.
+   *
+   * The sender's `name`/`avatar` are stamped onto the message AS OF SEND
+   * TIME, straight from their hello identity: participant ids are
+   * per-connection, so a message resolved against the roster goes
+   * anonymous the moment the sending connection closes. The stamp rides
+   * the ring into welcome replay, where the roster can no longer help. An
+   * anonymous sender has no name — stamp nothing, invent nothing.
    */
   chat(code: string, id: string, text: string): ChatMessage | undefined {
     const room = this.#rooms.get(code);
@@ -299,6 +306,8 @@ export class LiveRooms {
     const message: ChatMessage = {
       id: randomBytes(9).toString('base64url'),
       participantId: id,
+      ...(member.state.name !== undefined ? { name: member.state.name } : {}),
+      ...(member.state.avatar !== undefined ? { avatar: member.state.avatar } : {}),
       text: body,
       at: now,
     };

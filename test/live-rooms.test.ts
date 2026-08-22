@@ -248,6 +248,55 @@ describe('chat', () => {
     expect(late.chat.at(-1)!.text).toBe(`message ${MAX_CHAT_HISTORY + 4}`);
     rooms.stop();
   });
+
+  it('stamps sender name and avatar at send time, surviving welcome replay after they leave', () => {
+    const rooms = new LiveRooms();
+    const senderSocket = new FakeSocket();
+    const avatar = 'data:image/png;base64,AAAA';
+    const sender = rooms.join('CODE1', senderSocket, {
+      name: 'Sam',
+      avatar,
+      owner: true,
+      share: true,
+      expiresAt: soon(),
+    });
+    const other = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (sender === 'room-full' || other === 'room-full') throw new Error('unreachable');
+
+    const sent = rooms.chat('CODE1', sender.id, 'by the weir');
+    expect(sent).toMatchObject({ participantId: sender.id, name: 'Sam', avatar });
+    // The stamp rides the live fanout frame too.
+    expect(senderSocket.ofType('chat').at(-1)!).toMatchObject({ name: 'Sam', avatar });
+
+    // The sending connection closes; its id is gone from the roster for
+    // good — this is exactly the attribution bug. The stamp in the ring is
+    // what a late joiner (or the sender's own next connection) resolves.
+    rooms.leave('CODE1', sender.id);
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    expect(late.roster.some((entry) => entry.id === sender.id)).toBe(false);
+    expect(late.chat.at(-1)!).toMatchObject({
+      participantId: sender.id,
+      name: 'Sam',
+      avatar,
+      text: 'by the weir',
+    });
+    rooms.stop();
+  });
+
+  it('stamps nothing for an anonymous sender — no invented name, no avatar', () => {
+    const { rooms, ids } = roomOf(1); // roomOf joins with neither name nor avatar
+    const sent = rooms.chat('CODE1', ids[0]!, 'hello');
+    expect(sent!.name).toBeUndefined();
+    expect(sent!.avatar).toBeUndefined();
+    // Absent means absent: the keys are not on the retained entry at all.
+    expect('name' in sent!).toBe(false);
+    expect('avatar' in sent!).toBe(false);
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    expect('name' in late.chat[0]!).toBe(false);
+    rooms.stop();
+  });
 });
 
 describe('zones', () => {
