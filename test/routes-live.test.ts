@@ -42,7 +42,10 @@ const built: {
   push?: PushService;
 }[] = [];
 
-async function build(push?: PushService, options?: { pingIntervalMs?: number }) {
+async function build(
+  push?: PushService,
+  options?: { pingIntervalMs?: number; pushThrottleWindowMs?: number },
+) {
   const app = Fastify({ logger: false });
   const store = new MemorySessionStore();
   // One LiveRooms shared by the REST routes and the socket route, as in
@@ -700,7 +703,7 @@ describe('one owner per room — supersession and the zombie reaper', () => {
     expect(sam.closed).toBe(false);
   });
 
-  it('reaps a member that stops answering pings, with the normal leave fanout', async () => {
+  it('reaps a member that stops answering pings — retained as disconnected, never a left', async () => {
     const { app, url, track } = await build(undefined, { pingIntervalMs: 150 });
     const { code, updateToken } = await mintLive(app);
 
@@ -709,15 +712,21 @@ describe('one owner per room — supersession and the zombie reaper', () => {
     await joined(owner, { code, updateToken, name: 'Stu' });
 
     // A phone whose radio died without a TCP close: the socket answers
-    // nothing, but never says goodbye either.
+    // nothing, but never says goodbye either. This is EXACTLY the field
+    // case the retention model is for — the companion whose connection
+    // drops must not simply vanish from the share.
     const zombie = await TestClient.open(url(code), { autoPong: false });
     track(zombie);
     const zombieWelcome = await joined(zombie, { code, name: 'Ghost' });
     const zombieId = (zombieWelcome as { participantId: string }).participantId;
     await owner.next(); // the ghost's arrival
 
-    // Two ping rounds later the server terminates it and everyone hears.
-    expect(await owner.next(3000)).toMatchObject({ type: 'left', participantId: zombieId });
+    // Two ping rounds later the server terminates the SOCKET — and the
+    // roster keeps the member, stamped, as a participant update.
+    expect(await owner.next(3000)).toMatchObject({
+      type: 'participant',
+      participant: { id: zombieId, name: 'Ghost', disconnectedAt: expect.any(String) },
+    });
     await vi.waitFor(() => expect(zombie.closed).toBe(true));
   });
 });
@@ -812,7 +821,7 @@ describe('room state survives the room — persistence and rehydration', () => {
 
     // A stale persisted blob (as if from before a deploy) …
     await store.update(code, {
-      live: { zones: [], chat: [{ id: 'x', participantId: 'gone', text: 'old', at: new Date().toISOString() }], events: [], reachedMarkerIds: [], seenIdentities: [] },
+      live: { zones: [], chat: [{ id: 'x', participantId: 'gone', text: 'old', at: new Date().toISOString() }], events: [], reachedMarkerIds: [], seenIdentities: [], participants: [] },
     });
 
     const owner = await TestClient.open(url(code));
@@ -854,13 +863,20 @@ describe('quiet reconnects — join-once announcements and the silent baseline',
     const joinedBodies = () => payloads().filter((p) => p.body.includes('joined')).map((p) => p.body);
 
     // Sam churns: join, drop, rejoin, three times over — one announcement.
+    // Each drop RETAINS Sam as a disconnected entry (a participant update,
+    // never a left); each rejoin merges the old entry away with a genuine
+    // left before the fresh arrival fans out.
     for (let round = 0; round < 3; round += 1) {
       const sam = await TestClient.open(url(code));
       track(sam);
       await joined(sam, { code, name: 'Sam' });
-      await owner.next(); // arrival fanout still flows every time
+      if (round > 0) expect(await owner.next()).toMatchObject({ type: 'left' }); // the merged ghost
+      expect(await owner.next()).toMatchObject({ type: 'participant' }); // the arrival
       sam.ws.close();
-      expect(await owner.next()).toMatchObject({ type: 'left' });
+      expect(await owner.next()).toMatchObject({
+        type: 'participant',
+        participant: { name: 'Sam', disconnectedAt: expect.any(String) },
+      });
     }
     expect(joinedBodies()).toEqual(['Sam joined your share']);
 
@@ -936,12 +952,17 @@ describe('quiet reconnects — join-once announcements and the silent baseline',
     await owner.next(); // participant fanout
     expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
     sam.ws.close();
-    expect(await owner.next()).toMatchObject({ type: 'left' });
+    expect(await owner.next()).toMatchObject({
+      type: 'participant',
+      participant: { name: 'Sam', disconnectedAt: expect.any(String) },
+    });
 
-    // Sam reconnects, still inside: the baseline seeds occupancy silently.
+    // Sam reconnects, still inside: the old entry merges away (a genuine
+    // left) and the fresh member's baseline seeds occupancy silently.
     sam = await TestClient.open(url(code));
     track(sam);
     await joined(sam, { code, name: 'Sam' });
+    expect(await owner.next()).toMatchObject({ type: 'left' }); // the merged ghost
     await owner.next(); // arrival fanout
     sam.send({ type: 'position', position: inside });
     await owner.next(); // participant
@@ -963,4 +984,129 @@ describe('quiet reconnects — join-once announcements and the silent baseline',
     await owner.next(); // participant
     expect(await owner.next()).toMatchObject({ type: 'event', kind: 'entered', zoneId: 'z1' });
   }, 25_000);
+});
+
+describe('disconnecting is not leaving — over the wire', () => {
+  it('keeps the dropped companion on the map, and their quiet merge on return', async () => {
+    const push = new PushService(new MemoryPushStore());
+    const spy = vi.spyOn(push, 'sendToSession').mockResolvedValue();
+    // Throttle disarmed: the no-push assertions below must be the model's
+    // own silence, not the throttle riding to the rescue.
+    const { app, url, store, track } = await build(push, { pushThrottleWindowMs: 0 });
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    const friendWelcome = await joined(friend, { code, name: 'Sam' });
+    const friendId = (friendWelcome as { participantId: string }).participantId;
+    await owner.next(); // arrival
+
+    friend.send({ type: 'position', position: { lat: 51.6, lon: -0.2, accuracyM: 12 } });
+    await owner.next(); // fanout
+
+    // The companion's phone drops. Not a left: a participant update with
+    // the stamp, their last position still aboard.
+    friend.ws.close();
+    expect(await owner.next()).toMatchObject({
+      type: 'participant',
+      participant: {
+        id: friendId,
+        name: 'Sam',
+        position: { lat: 51.6, lon: -0.2 },
+        disconnectedAt: expect.any(String),
+      },
+    });
+
+    // Someone joining NOW is welcomed by the ghost too.
+    const watcher = await TestClient.open(url(code));
+    track(watcher);
+    const watcherWelcome = await joined(watcher, { code });
+    await owner.next(); // the watcher's arrival
+    expect(watcherWelcome['roster']).toMatchObject(
+      expect.arrayContaining([
+        expect.objectContaining({ id: friendId, name: 'Sam', disconnectedAt: expect.any(String) }),
+      ]),
+    );
+
+    // The snapshot lands in the persisted blob — whereabouts, never trails.
+    await vi.waitFor(async () => {
+      const live = (await store.get(code))!.live;
+      expect(live?.participants).toMatchObject([{ id: friendId, name: 'Sam' }]);
+    });
+
+    // Sam returns under the same name: the ghost merges away with a
+    // genuine left, and the fresh Sam stands alone, connected.
+    const before = spy.mock.calls.length;
+    const back = await TestClient.open(url(code));
+    track(back);
+    const backWelcome = await joined(back, { code, name: 'Sam' });
+    expect(
+      (backWelcome['roster'] as Array<Record<string, unknown>>).filter(
+        (entry) => entry['name'] === 'Sam',
+      ),
+    ).toEqual([]);
+    expect(await owner.next()).toMatchObject({ type: 'left', participantId: friendId });
+    const rejoined = (await owner.next()) as { participant: Record<string, unknown> };
+    expect(rejoined.participant).toMatchObject({ name: 'Sam' });
+    expect('disconnectedAt' in rejoined.participant).toBe(false);
+
+    // No push fired for the disconnect, none for the merge-reconnect —
+    // the join-once identity gate holds (throttle disarmed above).
+    expect(spy.mock.calls.length).toBe(before);
+  }, 15_000);
+
+  it('a recreated room greets the next joiner with the disconnected roster', async () => {
+    const { app, url, store, rooms, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    const friendWelcome = await joined(friend, { code, name: 'Sam' });
+    const friendId = (friendWelcome as { participantId: string }).participantId;
+    await owner.next(); // arrival
+    friend.send({ type: 'position', position: { lat: 51.6, lon: -0.2, accuracyM: 12 } });
+    await owner.next(); // fanout
+
+    // Sam drops, then the owner does: the last live connection takes the
+    // room from memory with it. The blob is all that remains.
+    friend.ws.close();
+    await owner.next(); // the disconnect stamp
+    owner.ws.close();
+    await vi.waitFor(() => expect(rooms.size(code)).toBe(0));
+    await vi.waitFor(async () => {
+      expect((await store.get(code))!.live?.participants ?? []).toHaveLength(2);
+    });
+
+    // The next joiner is greeted by both of them — greyed, in place.
+    const watcher = await TestClient.open(url(code));
+    track(watcher);
+    const welcome = await joined(watcher, { code });
+    const roster = welcome['roster'] as Array<Record<string, unknown>>;
+    expect(roster.map((entry) => entry['name']).sort()).toEqual(['Sam', 'Stu']);
+    for (const entry of roster) expect(entry['disconnectedAt']).toEqual(expect.any(String));
+    const sam = roster.find((entry) => entry['name'] === 'Sam')!;
+    expect(sam['id']).toBe(friendId);
+    expect(sam['position']).toMatchObject({ lat: 51.6, lon: -0.2 });
+
+    // The owner's return supersedes their own rehydrated ghost — one left,
+    // one Stu — while Sam's ghost stands.
+    const ownerBack = await TestClient.open(url(code));
+    track(ownerBack);
+    const backWelcome = await joined(ownerBack, { code, updateToken, name: 'Stu' });
+    expect(await watcher.next()).toMatchObject({ type: 'left' });
+    expect(await watcher.next()).toMatchObject({
+      type: 'participant',
+      participant: { name: 'Stu', owner: true },
+    });
+    const backRoster = backWelcome['roster'] as Array<Record<string, unknown>>;
+    expect(backRoster.filter((entry) => entry['name'] === 'Stu')).toEqual([]);
+    expect(backRoster.filter((entry) => entry['name'] === 'Sam')).toHaveLength(1);
+  }, 15_000);
 });

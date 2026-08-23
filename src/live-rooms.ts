@@ -27,10 +27,21 @@ import type {
  *
  * Deliberately in-memory and nothing else: the session RECORD stays the
  * source of truth for the owner (the route persists owner state to the
- * store), while joiners exist only while their socket is open. Nothing about
- * a joiner ever touches a datastore — reload means rejoin. This also means
- * rooms are single-instance; that is on the deferred register, not an
- * accident.
+ * store), while joiners are per-connection. This also means rooms are
+ * single-instance; that is on the deferred register, not an accident.
+ *
+ * DISCONNECTING IS NOT LEAVING (protocol 0.2.3). A socket close RETAINS the
+ * member in the roster — position, name, avatar, joinedAt, lastSeenAt
+ * intact — with disconnectedAt stamped and a `participant` update fanned
+ * out; `left` is reserved for genuine removal (owner supersession, a
+ * reconnect merging away its own disconnected entry, eviction). A hello
+ * presenting the identity a disconnected entry was keyed by (its hello
+ * name) merges: old entry removed with `left`, fresh connection joins —
+ * identity continuity only, nothing else inherited. Anonymous hellos have
+ * no key to merge on and accumulate, bounded by MAX_DISCONNECTED_RETAINED
+ * (oldest evicted with `left`). Disconnected members' last-known snapshots
+ * (never their trails) persist in the room-state blob, so a full room drop
+ * rehydrates them as disconnected roster entries.
  *
  * Live v2 adds the room's shared memory: a chat ring, named zones, a
  * detection-event ring and per-participant trails. It lives here while the
@@ -60,9 +71,18 @@ interface ZoneDetection {
 }
 
 interface Member {
-  socket: LiveSocket;
+  /** Null once disconnected — the member is retained, the wire is gone. */
+  socket: LiveSocket | null;
   state: LiveParticipant;
   share: boolean;
+  /**
+   * The announcement/merge key this member joined under — `n:<hello name>`
+   * for named non-owners, `anon` for nameless ones, undefined for owners
+   * (their key is the updateToken, handled by supersession). A reconnect
+   * presenting the same NAMED key merges away this member once it is
+   * disconnected; `anon` never merges — two strangers are not one person.
+   */
+  identity?: string | undefined;
   /**
    * Recent honoured fixes, oldest first, ≤ MAX_TRAIL_FIXES. Sent in the
    * WELCOME roster only — never in `participant` fanout — so `state` never
@@ -127,6 +147,26 @@ export interface LiveRoomState {
   reachedMarkerIds: string[];
   /** Announcement keys already used — see Room.seenIdentities. */
   seenIdentities: string[];
+  /**
+   * Last-known snapshots of DISCONNECTED members (id, name, avatar,
+   * position, joinedAt, lastSeenAt, disconnectedAt — never trails, sketches
+   * or markers), ≤ MAX_DISCONNECTED_RETAINED, oldest-disconnected first. A
+   * recreated room rehydrates them as disconnected roster entries, so "last
+   * connected" survives the room itself. Absent on pre-0.2.3 blobs — treat
+   * as empty. Detection state never rehydrates for them: a reconnect merges
+   * into a fresh member and baselines silently, like any join.
+   */
+  participants: LiveParticipant[];
+}
+
+/**
+ * The one spelling of the announcement/merge identity key: the hello name
+ * the web re-presents per code on rejoin, or the shared `anon` key for
+ * hellos with no reusable identity. The route uses it at hello; hydration
+ * uses it to re-key rehydrated snapshots so a reconnect can still merge.
+ */
+export function identityKeyFor(name: string | undefined): string {
+  return name !== undefined && name !== '' ? `n:${name}` : 'anon';
 }
 
 /** Everything a welcome needs, straight from the room's retained state. */
@@ -153,6 +193,36 @@ const MAX_REACHED_IDS = MAX_ROOM_PARTICIPANTS * MAX_SESSION_MARKERS;
 
 /** Bound on persisted announcement keys; oldest shed first past it. */
 const MAX_SEEN_IDENTITIES = 64;
+
+/**
+ * Most DISCONNECTED members a room retains (in memory and in the persisted
+ * blob alike), so anonymous churn cannot bloat the roster forever — each
+ * nameless reconnect is a new entry by construction. Oldest-disconnected
+ * evicted first, with a genuine `left`. Stated plainly: the eviction does
+ * not spare the owner's entry, whose last-known state also lives on the
+ * session record itself.
+ */
+export const MAX_DISCONNECTED_RETAINED = 20;
+
+/**
+ * The bounded, serialisation-safe snapshot of a member for the persisted
+ * blob: identity and last-known whereabouts only. Trails stay memory-only
+ * by design; sketches and markers vanish with the connection (the web
+ * replays markers on rejoin).
+ */
+function snapshotOf(state: LiveParticipant): LiveParticipant {
+  return {
+    id: state.id,
+    owner: state.owner,
+    joinedAt: state.joinedAt,
+    lastSeenAt: state.lastSeenAt,
+    updatedAt: state.updatedAt,
+    ...(state.name !== undefined ? { name: state.name } : {}),
+    ...(state.avatar !== undefined ? { avatar: state.avatar } : {}),
+    ...(state.position !== undefined ? { position: state.position } : {}),
+    ...(state.disconnectedAt !== undefined ? { disconnectedAt: state.disconnectedAt } : {}),
+  };
+}
 
 /**
  * Great-circle distance in metres (haversine). Detection distances are tens
@@ -210,6 +280,24 @@ export class LiveRooms {
         reachedEver: new Set(reached),
         seenIdentities: new Set((hydrate?.seenIdentities ?? []).slice(-MAX_SEEN_IDENTITIES)),
       };
+      // Rehydrate disconnected members as ghost entries: retained roster
+      // presence with no wire — so "last connected" survives the room. No
+      // detection state comes back with them (a reconnect merges into a
+      // fresh member and baselines silently); trails and markers are gone
+      // by design. `?? []` because pre-0.2.3 blobs carry no participants.
+      for (const snapshot of (hydrate?.participants ?? []).slice(-MAX_DISCONNECTED_RETAINED)) {
+        room.members.set(snapshot.id, {
+          socket: null,
+          state: snapshot,
+          share: false,
+          identity: snapshot.owner ? undefined : identityKeyFor(snapshot.name),
+          trail: [],
+          zoneState: new Map(),
+          markerStreaks: new Map(),
+          reached: new Set(),
+          baselined: true,
+        });
+      }
       this.#rooms.set(code, room);
       const timer = setTimeout(() => this.expire(code), Math.max(0, options.expiresAt - Date.now()));
       timer.unref?.();
@@ -219,10 +307,14 @@ export class LiveRooms {
     // and there is exactly one of those per session — so any owner already
     // in the room is a previous connection of the same person: the code
     // screen's headless socket whose close is still in flight, a zombie the
-    // heartbeat has not reaped yet, a reconnect after radio churn. Without
-    // this the owner stands in every roster twice (field-observed: "Stu"
-    // and "You", both sharer, distinct join times) until the close lands or
+    // heartbeat has not reaped yet, a reconnect after radio churn — or,
+    // since disconnects retain, their own disconnected entry. Without this
+    // the owner stands in every roster twice (field-observed: "Stu" and
+    // "You", both sharer, distinct join times) until the close lands or
     // the ping reaper catches up. Supersede: remove, tell the room, hang up.
+    // This is also the owner's whole reconnect-merge story — their hello
+    // carries no identity key (see the merge below), so the two mechanisms
+    // cannot both fire on one join.
     if (options.owner) {
       for (const [staleId, stale] of [...room.members]) {
         if (!stale.state.owner) continue;
@@ -233,13 +325,36 @@ export class LiveRooms {
         );
         this.#broadcast(code, { type: 'left', participantId: staleId });
         try {
-          stale.socket.close();
+          stale.socket?.close();
         } catch {
           // A socket that will not close is already gone.
         }
       }
     }
-    if (room.members.size >= MAX_ROOM_PARTICIPANTS) return 'room-full';
+    // RECONNECT MERGE — the non-owner mirror of supersession, keyed on the
+    // hello name instead of the updateToken. A join presenting the same
+    // NAMED identity a DISCONNECTED entry was keyed by is that person back:
+    // remove the old entry with a genuine `left` and let the fresh
+    // connection stand alone — identity continuity only; markers, trail
+    // and detection state do not carry over (the web replays markers on
+    // rejoin, and occupancy re-baselines silently). A still-CONNECTED
+    // same-name member is never touched — superseding on a guessable name
+    // would let anyone kick anyone — and `anon` never merges: two
+    // strangers with no name are not one person.
+    if (!options.owner && options.identity !== undefined && options.identity !== 'anon') {
+      for (const [ghostId, ghost] of [...room.members]) {
+        if (ghost.socket !== null || ghost.identity !== options.identity) continue;
+        room.members.delete(ghostId);
+        this.#discardMarkerState(
+          room,
+          (ghost.state.markers ?? []).map((marker) => marker.id),
+        );
+        this.#broadcast(code, { type: 'left', participantId: ghostId });
+      }
+    }
+    // Disconnected entries hold a roster place, not a seat: only live
+    // connections count against the cap.
+    if (this.#connectedCount(room) >= MAX_ROOM_PARTICIPANTS) return 'room-full';
 
     const id = randomBytes(6).toString('base64url');
     const now = new Date().toISOString();
@@ -279,6 +394,7 @@ export class LiveRooms {
       socket,
       state,
       share: options.share,
+      identity: options.identity,
       trail: [],
       zoneState: new Map(),
       markerStreaks: new Map(),
@@ -289,6 +405,11 @@ export class LiveRooms {
     return result;
   }
 
+  /**
+   * GENUINE removal — the member is gone from the roster with a `left`.
+   * Not the socket-close path: that is disconnect(), which retains. This
+   * remains for callers that mean it (and for tests of removal fanout).
+   */
   leave(code: string, id: string): void {
     const room = this.#rooms.get(code);
     if (room === undefined) return;
@@ -306,6 +427,51 @@ export class LiveRooms {
       return;
     }
     this.#broadcast(code, { type: 'left', participantId: id });
+  }
+
+  /**
+   * The socket-close path: DISCONNECTING IS NOT LEAVING. The member stays
+   * in the roster — position, trail, name, avatar, joinedAt, lastSeenAt all
+   * intact — with disconnectedAt stamped and a `participant` update fanned
+   * out, so everyone still sees their last position and when they were last
+   * connected. Over-cap disconnected entries are evicted oldest-first with
+   * a genuine `left`.
+   *
+   * Returns the room's durable state (now carrying this member's snapshot)
+   * for the route to persist — computed HERE because when the last live
+   * connection goes, the room itself is dropped from memory in the same
+   * breath, and the state must be captured before it is. The persisted
+   * snapshots are what a recreated room rehydrates the roster from.
+   */
+  disconnect(code: string, id: string): LiveRoomState | undefined {
+    const room = this.#rooms.get(code);
+    const member = room?.members.get(id);
+    if (room === undefined || member === undefined || member.socket === null) return undefined;
+    member.socket = null;
+    // lastSeenAt keeps vouching for their last FRAME; disconnectedAt is the
+    // "last connected" moment the roster shows.
+    member.state = { ...member.state, disconnectedAt: new Date().toISOString() };
+    this.#broadcast(code, { type: 'participant', participant: member.state });
+
+    const ghosts = [...room.members.entries()]
+      .filter(([, entry]) => entry.socket === null)
+      .sort(
+        ([, a], [, b]) =>
+          (a.state.disconnectedAt ?? '').localeCompare(b.state.disconnectedAt ?? ''),
+      );
+    while (ghosts.length > MAX_DISCONNECTED_RETAINED) {
+      const [ghostId, ghost] = ghosts.shift()!;
+      room.members.delete(ghostId);
+      this.#discardMarkerState(
+        room,
+        (ghost.state.markers ?? []).map((marker) => marker.id),
+      );
+      this.#broadcast(code, { type: 'left', participantId: ghostId });
+    }
+
+    const state = this.#liveStateOf(room);
+    if (this.#connectedCount(room) === 0) this.#drop(code);
+    return state;
   }
 
   /**
@@ -497,13 +663,35 @@ export class LiveRooms {
   liveState(code: string): LiveRoomState | undefined {
     const room = this.#rooms.get(code);
     if (room === undefined) return undefined;
+    return this.#liveStateOf(room);
+  }
+
+  #liveStateOf(room: Room): LiveRoomState {
+    // Only DISCONNECTED members persist: a live connection is its own
+    // record of presence, and a process death leaves no honest moment to
+    // stamp it with. Oldest-disconnected first, so the slice keeps the
+    // most recently seen.
+    const participants = [...room.members.values()]
+      .filter((member) => member.socket === null)
+      .map((member) => snapshotOf(member.state))
+      .sort((a, b) => (a.disconnectedAt ?? '').localeCompare(b.disconnectedAt ?? ''))
+      .slice(-MAX_DISCONNECTED_RETAINED);
     return {
       zones: [...room.zones],
       chat: [...room.chat],
       events: [...room.events],
       reachedMarkerIds: [...room.reachedEver].slice(-MAX_REACHED_IDS),
       seenIdentities: [...room.seenIdentities].slice(-MAX_SEEN_IDENTITIES),
+      participants,
     };
+  }
+
+  #connectedCount(room: Room): number {
+    let count = 0;
+    for (const member of room.members.values()) {
+      if (member.socket !== null) count += 1;
+    }
+    return count;
   }
 
   /**
@@ -528,7 +716,7 @@ export class LiveRooms {
     this.#broadcast(code, { type: 'expired' });
     for (const member of room.members.values()) {
       try {
-        member.socket.close();
+        member.socket?.close();
       } catch {
         // A socket that will not close is already gone.
       }
@@ -664,6 +852,7 @@ export class LiveRooms {
     const data = JSON.stringify(message);
     for (const [memberId, member] of room.members) {
       if (memberId === exceptId) continue;
+      if (member.socket === null) continue; // disconnected: retained, not reachable
       try {
         member.socket.send(data);
       } catch {

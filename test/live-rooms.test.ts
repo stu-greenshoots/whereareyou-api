@@ -8,7 +8,14 @@ import {
   MAX_TRAIL_FIXES,
 } from '@whereareyou/protocol';
 import type { Position } from '@whereareyou/protocol';
-import { LiveRooms, distanceM, type LiveSocket } from '../src/live-rooms.js';
+import {
+  LiveRooms,
+  MAX_DISCONNECTED_RETAINED,
+  distanceM,
+  identityKeyFor,
+  type LiveRoomState,
+  type LiveSocket,
+} from '../src/live-rooms.js';
 import { sleep } from './helpers.js';
 
 /** A socket that just remembers what happened to it. */
@@ -628,6 +635,253 @@ describe('trails', () => {
     const entry = late.roster[0]!.trail![0]!;
     expect(typeof entry.takenAt).toBe('string');
     expect(Number.isFinite(Date.parse(entry.takenAt))).toBe(true);
+    rooms.stop();
+  });
+});
+
+describe('disconnecting is not leaving', () => {
+  /** Join a named sharer the way the route would: identity keyed on the name. */
+  function joinNamed(rooms: LiveRooms, socket: LiveSocket, name: string) {
+    const result = rooms.join('CODE1', socket, {
+      name,
+      owner: false,
+      share: true,
+      expiresAt: soon(),
+      identity: identityKeyFor(name),
+    });
+    if (result === 'room-full') throw new Error('unreachable');
+    return result;
+  }
+
+  it('retains the member: stamped, fanned out as participant — never a left', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const owner = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon() });
+    if (owner === 'room-full') throw new Error('unreachable');
+    const sam = joinNamed(rooms, new FakeSocket(), 'Sam');
+    rooms.position('CODE1', sam.id, fix(50));
+
+    const state = rooms.disconnect('CODE1', sam.id);
+    expect(a.ofType('left')).toHaveLength(0);
+    const update = a.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    expect(update).toMatchObject({
+      id: sam.id,
+      name: 'Sam',
+      disconnectedAt: expect.any(String),
+      position: { lat: fix(50).lat },
+    });
+
+    // A late joiner still sees them — greyed, at their last position.
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    const ghost = late.roster.find((entry) => entry.id === sam.id)!;
+    expect(ghost).toMatchObject({ name: 'Sam', disconnectedAt: expect.any(String) });
+    expect(ghost.position!.lat).toBeCloseTo(fix(50).lat, 10);
+
+    // And the returned durable state carries the snapshot — identity and
+    // whereabouts only, no trail, no markers.
+    expect(state!.participants).toMatchObject([
+      { id: sam.id, name: 'Sam', owner: false, disconnectedAt: expect.any(String) },
+    ]);
+    expect('trail' in state!.participants[0]!).toBe(false);
+    rooms.stop();
+  });
+
+  it('drops the room with the last live connection, returning the state that outlives it', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const solo = rooms.join('CODE1', a, { name: 'Stu', owner: true, share: true, expiresAt: soon() });
+    if (solo === 'room-full') throw new Error('unreachable');
+    rooms.position('CODE1', solo.id, fix(10));
+
+    const state = rooms.disconnect('CODE1', solo.id);
+    // The room is gone from memory — the snapshot in `state` is all that
+    // remains, which is exactly why disconnect() computes it itself.
+    expect(rooms.size('CODE1')).toBe(0);
+    expect(rooms.liveState('CODE1')).toBeUndefined();
+    expect(state!.participants).toMatchObject([
+      { name: 'Stu', owner: true, disconnectedAt: expect.any(String) },
+    ]);
+    expect(state!.participants[0]!.position!.lat).toBeCloseTo(fix(10).lat, 10);
+    rooms.stop();
+  });
+
+  it('merges a reconnect of the same named identity: one entry, connected', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const owner = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon() });
+    if (owner === 'room-full') throw new Error('unreachable');
+    const sam = joinNamed(rooms, new FakeSocket(), 'Sam');
+    rooms.disconnect('CODE1', sam.id);
+
+    const back = joinNamed(rooms, new FakeSocket(), 'Sam');
+    // The old entry went with a GENUINE left — this is removal, not a drop.
+    expect(a.ofType('left').at(-1)).toMatchObject({ participantId: sam.id });
+    // The returning Sam's own welcome holds no ghost of themselves.
+    expect(back.roster.some((entry) => entry.name === 'Sam')).toBe(false);
+    // The roster holds exactly one Sam, connected.
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    const sams = late.roster.filter((entry) => entry.name === 'Sam');
+    expect(sams).toHaveLength(1);
+    expect(sams[0]!.id).toBe(back.id);
+    expect(sams[0]!.disconnectedAt).toBeUndefined();
+    rooms.stop();
+  });
+
+  it('never merges away a still-connected same-name member, and anon never merges', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const owner = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon() });
+    if (owner === 'room-full') throw new Error('unreachable');
+
+    // Two CONNECTED Sams stand — superseding on a guessable name would let
+    // anyone kick anyone (posture pinned at the route level too).
+    const sam = joinNamed(rooms, new FakeSocket(), 'Sam');
+    joinNamed(rooms, new FakeSocket(), 'Sam');
+    expect(a.ofType('left')).toHaveLength(0);
+    expect(rooms.size('CODE1')).toBe(3);
+
+    // Two disconnected ANONYMOUS entries accumulate — strangers, not one
+    // person reconnecting.
+    for (let i = 0; i < 2; i += 1) {
+      const anon = rooms.join('CODE1', new FakeSocket(), {
+        owner: false,
+        share: true,
+        expiresAt: soon(),
+        identity: 'anon',
+      });
+      if (anon === 'room-full') throw new Error('unreachable');
+      rooms.disconnect('CODE1', anon.id);
+    }
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    expect(late.roster.filter((entry) => entry.disconnectedAt !== undefined)).toHaveLength(2);
+    void sam;
+    rooms.stop();
+  });
+
+  it('caps retained disconnected members, evicting the oldest with a left', () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const owner = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon() });
+    if (owner === 'room-full') throw new Error('unreachable');
+
+    const churned: string[] = [];
+    for (let i = 0; i < MAX_DISCONNECTED_RETAINED + 3; i += 1) {
+      const anon = rooms.join('CODE1', new FakeSocket(), {
+        owner: false,
+        share: true,
+        expiresAt: soon(),
+        identity: 'anon',
+      });
+      if (anon === 'room-full') throw new Error('unreachable');
+      churned.push(anon.id);
+      rooms.disconnect('CODE1', anon.id);
+    }
+
+    // The three oldest were evicted, each with a genuine left.
+    expect(a.ofType('left').map((frame) => frame['participantId'])).toEqual(churned.slice(0, 3));
+    const state = rooms.liveState('CODE1')!;
+    expect(state.participants).toHaveLength(MAX_DISCONNECTED_RETAINED);
+    expect(state.participants[0]!.id).toBe(churned[3]);
+
+    // Ghosts hold a roster place, not a seat: a full cap of them still
+    // leaves every live seat open.
+    const seated = rooms.join('CODE1', new FakeSocket(), { owner: false, share: true, expiresAt: soon() });
+    expect(seated).not.toBe('room-full');
+    rooms.stop();
+  });
+
+  it('rehydrates persisted snapshots as disconnected roster entries a reconnect can merge', () => {
+    const rooms = new LiveRooms();
+    const now = new Date().toISOString();
+    const ghost = {
+      id: 'ghost1',
+      name: 'Sam',
+      owner: false,
+      position: fix(50),
+      joinedAt: now,
+      lastSeenAt: now,
+      disconnectedAt: now,
+      updatedAt: now,
+    };
+    const hydrate: LiveRoomState = {
+      zones: [],
+      chat: [],
+      events: [],
+      reachedMarkerIds: [],
+      seenIdentities: ['n:Sam'],
+      participants: [ghost],
+    };
+
+    const a = new FakeSocket();
+    const owner = rooms.join('CODE1', a, { owner: true, share: true, expiresAt: soon(), hydrate });
+    if (owner === 'room-full') throw new Error('unreachable');
+    expect(owner.roster).toMatchObject([{ id: 'ghost1', name: 'Sam', disconnectedAt: now }]);
+
+    // Sam comes back: the rehydrated ghost merges away like a live one, and
+    // the identity was already seen — a reconnect, not news.
+    const back = joinNamed(rooms, new FakeSocket(), 'Sam');
+    expect(back.announce).toBe(false);
+    expect(a.ofType('left').at(-1)).toMatchObject({ participantId: 'ghost1' });
+    expect(back.roster.some((entry) => entry.id === 'ghost1')).toBe(false);
+    rooms.stop();
+  });
+
+  it("composes with owner supersession: the owner's ghost goes once, by the owner path", () => {
+    const rooms = new LiveRooms();
+    const a = new FakeSocket();
+    const b = new FakeSocket();
+    const first = rooms.join('CODE1', a, { name: 'Stu', owner: true, share: true, expiresAt: soon() });
+    if (first === 'room-full') throw new Error('unreachable');
+    const friend = joinNamed(rooms, b, 'Sam');
+    void friend;
+
+    // The owner's phone drops: retained like anyone else's.
+    rooms.disconnect('CODE1', first.id);
+    expect((b.ofType('participant').at(-1)!['participant'] as Record<string, unknown>)['disconnectedAt']).toEqual(
+      expect.any(String),
+    );
+
+    // The owner reconnects: supersession takes the ghost — exactly one
+    // left, exactly one owner standing. The identity merge cannot also
+    // fire: an owner hello carries no identity key.
+    const again = rooms.join('CODE1', new FakeSocket(), { name: 'Stu', owner: true, share: true, expiresAt: soon() });
+    if (again === 'room-full') throw new Error('unreachable');
+    expect(b.ofType('left')).toHaveLength(1);
+    expect(b.ofType('left')[0]).toMatchObject({ participantId: first.id });
+
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    expect(late.roster.filter((entry) => entry.owner)).toHaveLength(1);
+    expect(late.roster.find((entry) => entry.owner)!.id).toBe(again.id);
+    rooms.stop();
+  });
+
+  it('a rehydrated owner ghost is superseded on the owner rejoin — no duplicate Stu', () => {
+    const rooms = new LiveRooms();
+    const now = new Date().toISOString();
+    const hydrate: LiveRoomState = {
+      zones: [],
+      chat: [],
+      events: [],
+      reachedMarkerIds: [],
+      seenIdentities: [],
+      participants: [
+        { id: 'og', name: 'Stu', owner: true, joinedAt: now, lastSeenAt: now, disconnectedAt: now, updatedAt: now },
+      ],
+    };
+    const owner = rooms.join('CODE1', new FakeSocket(), {
+      name: 'Stu',
+      owner: true,
+      share: true,
+      expiresAt: soon(),
+      hydrate,
+    });
+    if (owner === 'room-full') throw new Error('unreachable');
+    // The ghost was removed BEFORE the roster was cut: no double owner.
+    expect(owner.roster).toEqual([]);
     rooms.stop();
   });
 });

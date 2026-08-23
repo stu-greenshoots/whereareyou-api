@@ -11,7 +11,7 @@ import type {
 import type { WebSocket } from 'ws';
 import { tokensMatch } from './routes.js';
 import type { SessionStore } from './store.js';
-import type { LiveRooms } from './live-rooms.js';
+import { identityKeyFor, type LiveRooms } from './live-rooms.js';
 import { PushThrottle, type PushService } from './push.js';
 
 /**
@@ -237,12 +237,10 @@ export async function registerLive(
               hydrate: session.live,
               // The stable identity this wire has for a non-owner: the hello
               // name the web re-presents per code on rejoin. No name, no
-              // reusable identity — one shared fallback key, announced once.
-              identity: isOwner
-                ? undefined
-                : message.name !== undefined && message.name !== ''
-                  ? `n:${message.name}`
-                  : 'anon',
+              // reusable identity — one shared fallback key, announced once,
+              // never merged. Owners carry none: their key is the
+              // updateToken, and supersession is their reconnect story.
+              identity: isOwner ? undefined : identityKeyFor(message.name),
             });
             if (result === 'room-full') return refuse('room-full');
 
@@ -396,7 +394,22 @@ export async function registerLive(
         for (const timer of pendingTimers.values()) clearTimeout(timer);
         pendingTimers.clear();
         pending.clear();
-        if (code !== null && participantId !== null) rooms.leave(code, participantId);
+        if (code !== null && participantId !== null) {
+          // Disconnecting is not leaving: the room retains the member with
+          // disconnectedAt stamped (a `participant` fanout, never a `left`)
+          // and hands back its durable state in the same call — captured
+          // there because the last live connection going drops the room
+          // from memory in the same breath. Persisting it is what lets a
+          // recreated room greet the next joiner with the disconnected
+          // roster. No push for a disconnect: silence is not news.
+          const state = rooms.disconnect(code, participantId);
+          if (state !== undefined) {
+            store.update(code, { live: state }).catch(() => {
+              // A failed write must not take the close handler down; the
+              // next persistLive carries the same snapshots again.
+            });
+          }
+        }
       });
       socket.on('error', () => socket.terminate());
     },

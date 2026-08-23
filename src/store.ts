@@ -8,8 +8,10 @@ import type { LiveRoomState } from './live-rooms.js';
  * zones/chat/events they come back to must still be there. Bounded by the
  * protocol caps (MAX_SESSION_ZONES / MAX_CHAT_HISTORY / MAX_EVENT_HISTORY).
  * `reachedMarkerIds` is every marker id a 'reached' has ever fired for, so
- * a rejoin does not re-fire it. INTERNAL ONLY: this field never appears in
- * any REST response — chat bodies and zone names are user content and the
+ * a rejoin does not re-fire it. `participants` is the last-known snapshots
+ * of DISCONNECTED members, so "last connected" survives the room too.
+ * INTERNAL ONLY: this field never appears in any REST response — chat
+ * bodies, zone names and participant whereabouts are user content and the
  * resolve payload has no business carrying them.
  */
 export type { LiveRoomState };

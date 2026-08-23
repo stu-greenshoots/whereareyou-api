@@ -265,7 +265,7 @@ describe.skipIf(!available)('RedisSessionStore', () => {
         {
           id: 'z1',
           name: 'weir',
-          center: { lat: 52.9, lon: -1.9, accuracyM: 5, source: 'manual' as const },
+          center: { lat: 52.9, lon: -1.9, accuracyM: 5, source: 'manual' as const, takenAt: new Date().toISOString() },
           radiusM: 100,
           createdBy: 'p1',
           createdAt: new Date().toISOString(),
@@ -275,6 +275,20 @@ describe.skipIf(!available)('RedisSessionStore', () => {
       events: [{ kind: 'reached' as const, participantId: 'p1', markerId: 'm1', at: new Date().toISOString() }],
       reachedMarkerIds: ['m1'],
       seenIdentities: ['n:Sam'],
+      // A disconnected member's last-known snapshot — "last connected"
+      // must survive the room, so it must survive the store round-trip.
+      participants: [
+        {
+          id: 'p1',
+          name: 'Sam',
+          owner: false,
+          position: { lat: 52.9, lon: -1.9, accuracyM: 8, source: 'gnss' as const, takenAt: new Date().toISOString() },
+          joinedAt: new Date().toISOString(),
+          lastSeenAt: new Date().toISOString(),
+          disconnectedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
     };
     await store.update(session.code, { live });
     expect((await store.get(session.code))!.live).toEqual(live);
