@@ -455,6 +455,17 @@ export function registerRoutes(
     // follow someone must not quietly stop doing so.
     const upgradeToLive = body['mode'] === 'live' && session.mode !== 'live';
 
+    // A reported (third-party) share whose owner goes live starts streaming
+    // the owner's OWN position, so a stored `third-party` would mislabel what
+    // `position` now means — the console's REPORTED banner would be pointing
+    // at the caller themselves. The upgrade may therefore carry
+    // `subject: 'self'`, accepted only at that moment and only in that
+    // direction: a code can never quietly become "somewhere else" after
+    // minting, and an already-live session keeps the subject it was born
+    // with. The marked spots keep carrying the reported place.
+    const subjectFlip =
+      upgradeToLive && body['subject'] === 'self' && session.subject === 'third-party';
+
     if (session.mode !== 'live' && !upgradeToLive) {
       return fail(reply, 409, 'not-live', 'session is static and cannot be updated');
     }
@@ -486,6 +497,7 @@ export function registerRoutes(
     await store.update(parsed.code, {
       ...(position !== undefined ? { position } : {}),
       ...(upgradeToLive ? { mode: 'live' as const } : {}),
+      ...(subjectFlip ? { subject: 'self' as const } : {}),
       ...(sketch !== undefined ? { sketch } : {}),
       ...(markers !== undefined ? { markers } : {}),
       updatedAt: Date.now(),
