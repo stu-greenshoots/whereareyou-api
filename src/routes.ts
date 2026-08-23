@@ -427,7 +427,7 @@ export function registerRoutes(
     if (push !== undefined) {
       void push.sendToSession(parsed.code, {
         title: 'whereareyou',
-        body: 'An operator has looked up your code.',
+        body: 'Someone looked up your code.',
       });
     }
 

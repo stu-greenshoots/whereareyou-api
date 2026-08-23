@@ -156,7 +156,7 @@ describe('POST /v1/sessions/:code/push', () => {
 });
 
 describe('resolve fires the lookup notification', () => {
-  it('pushes the generic body to subscribers when an operator resolves', async () => {
+  it('pushes the generic body to subscribers when someone resolves', async () => {
     const { app, sender } = build();
     const { code } = await mint(app);
     await subscribe(app, code, { subscription: subscription(1) });
@@ -172,7 +172,7 @@ describe('resolve fires the lookup notification', () => {
     await vi.waitFor(() => expect(sender.sent).toHaveLength(1));
     expect(sender.sent[0]!.payload).toEqual({
       title: 'whereareyou',
-      body: 'An operator has looked up your code.',
+      body: 'Someone looked up your code.',
     });
     // The one rule, checked where it matters: nothing position-shaped rides along.
     const serialised = JSON.stringify(sender.sent[0]!.payload);
