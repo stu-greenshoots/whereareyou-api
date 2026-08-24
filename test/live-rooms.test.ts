@@ -210,6 +210,105 @@ function roomOf(n: number) {
   return { rooms, sockets, ids };
 }
 
+describe('sharing is a switch, not a fate', () => {
+  it('going dark keeps the person, drops the position, and stops honouring fixes', () => {
+    const { rooms, sockets, ids } = roomOf(2);
+    rooms.position('CODE1', ids[1]!, fix(0));
+    expect(sockets[0]!.ofType('participant').at(-1)!['participant']).toMatchObject({
+      id: ids[1],
+      position: { lat: 0 },
+    });
+
+    expect(rooms.setShare('CODE1', ids[1]!, false)).toBe(true);
+    const dark = sockets[0]!.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    // Present, not sharing: still in the roster, no position — and NOT a
+    // ghost, which is the state this must never be mistaken for.
+    expect(dark['id']).toBe(ids[1]);
+    expect(dark).not.toHaveProperty('position');
+    expect(dark).not.toHaveProperty('disconnectedAt');
+
+    // A fix arriving after the switch is dropped, exactly like a watcher's.
+    const before = sockets[0]!.sent.length;
+    rooms.position('CODE1', ids[1]!, fix(100));
+    expect(sockets[0]!.sent.length).toBe(before);
+    rooms.stop();
+  });
+
+  it('resumes on the way back, and a no-op flip says nothing', () => {
+    const { rooms, sockets, ids } = roomOf(2);
+    rooms.setShare('CODE1', ids[1]!, false);
+
+    // Already off: no change, no frame.
+    const quiet = sockets[0]!.sent.length;
+    expect(rooms.setShare('CODE1', ids[1]!, false)).toBe(false);
+    expect(sockets[0]!.sent.length).toBe(quiet);
+
+    expect(rooms.setShare('CODE1', ids[1]!, true)).toBe(true);
+    rooms.position('CODE1', ids[1]!, fix(250));
+    expect(sockets[0]!.ofType('participant').at(-1)!['participant']).toMatchObject({
+      id: ids[1],
+      position: { accuracyM: 5 },
+    });
+    rooms.stop();
+  });
+
+  it('takes the trail with it, so a late joiner gets no path they stopped sharing', () => {
+    const { rooms, ids } = roomOf(2);
+    rooms.position('CODE1', ids[1]!, fix(0));
+    rooms.position('CODE1', ids[1]!, fix(50));
+
+    const early = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (early === 'room-full') throw new Error('unreachable');
+    expect(early.roster.find((entry) => entry.id === ids[1])!.trail).toHaveLength(2);
+
+    rooms.setShare('CODE1', ids[1]!, false);
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    const entry = late.roster.find((member) => member.id === ids[1])!;
+    expect(entry.trail).toBeUndefined();
+    expect(entry.position).toBeUndefined();
+    rooms.stop();
+  });
+
+  it('re-baselines occupancy silently on resume, so a dark walk fires nothing', () => {
+    const { rooms, ids } = roomOf(2);
+    rooms.zoneCreate('CODE1', ids[0]!, { id: 'z1', name: 'weir', center: fix(0), radiusM: 100 });
+    rooms.position('CODE1', ids[1]!, fix(50)); // silent occupancy baseline: inside
+    rooms.position('CODE1', ids[1]!, fix(50));
+
+    // They go dark, walk well clear, and come back on. The first fix after
+    // is state rediscovered, not a transition observed — no synthetic left.
+    rooms.setShare('CODE1', ids[1]!, false);
+    rooms.setShare('CODE1', ids[1]!, true);
+    expect(rooms.position('CODE1', ids[1]!, fix(900))).toEqual([]);
+    // And the walk back in is a real arrival again.
+    expect(rooms.position('CODE1', ids[1]!, fix(50))).toEqual([]);
+    expect(rooms.position('CODE1', ids[1]!, fix(50))).toMatchObject([{ kind: 'entered', zoneId: 'z1' }]);
+    rooms.stop();
+  });
+
+  it('is refused for a member the room does not have, or has already lost', () => {
+    const { rooms, ids } = roomOf(2);
+    expect(rooms.setShare('CODE1', 'nobody', false)).toBe(false);
+    expect(rooms.setShare('NOPE1', ids[1]!, false)).toBe(false);
+    rooms.disconnect('CODE1', ids[1]!);
+    // A retained ghost has no wire to change its mind over.
+    expect(rooms.setShare('CODE1', ids[1]!, false)).toBe(false);
+    rooms.stop();
+  });
+
+  it('lets the OWNER run a session while broadcasting nothing', () => {
+    const { rooms, sockets, ids } = roomOf(2);
+    rooms.position('CODE1', ids[0]!, fix(0));
+    expect(rooms.setShare('CODE1', ids[0]!, false)).toBe(true);
+    const owner = sockets[1]!.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    expect(owner).toMatchObject({ id: ids[0], owner: true });
+    expect(owner).not.toHaveProperty('position');
+    expect(owner).not.toHaveProperty('disconnectedAt');
+    rooms.stop();
+  });
+});
+
 describe('the sanity of the test geometry', () => {
   it('fix(n) really is n metres from the origin, by the same haversine', () => {
     expect(distanceM(fix(0), fix(100))).toBeCloseTo(100, 0);

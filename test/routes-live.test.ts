@@ -282,6 +282,82 @@ describe('live room state', () => {
     expect(stored!.position.lat).toBe(POSITION.lat);
   });
 
+  it('lets a joiner go dark and come back — still in the roster, off the map', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await owner.next(); // Sam's arrival
+
+    friend.send({ type: 'position', position: { lat: 51.6, lon: -0.2, accuracyM: 12 } });
+    expect(await owner.next()).toMatchObject({ participant: { name: 'Sam', position: { lat: 51.6 } } });
+
+    friend.send({ type: 'share', share: false });
+    const dark = (await owner.next())['participant'] as Record<string, unknown>;
+    // Present, not sharing — and emphatically not a ghost: a dropped socket
+    // stamps disconnectedAt and KEEPS the position, which is the opposite
+    // shape and means something else entirely.
+    expect(dark).toMatchObject({ name: 'Sam' });
+    expect(dark).not.toHaveProperty('position');
+    expect(dark).not.toHaveProperty('disconnectedAt');
+
+    // Past the per-type floor, so nothing here is merely deferred.
+    await sleep(1100);
+    friend.send({ type: 'position', position: { lat: 51.7, lon: -0.3, accuracyM: 9 } });
+    await owner.expectNothing();
+
+    await sleep(1100);
+    friend.send({ type: 'share', share: true });
+    await owner.next(); // the resume fanout
+    await sleep(1100);
+    friend.send({ type: 'position', position: { lat: 51.8, lon: -0.4, accuracyM: 7 } });
+    expect(await owner.next()).toMatchObject({ participant: { name: 'Sam', position: { lat: 51.8 } } });
+  });
+
+  it('lets the OWNER run the session while broadcasting nothing', async () => {
+    const { app, url, store, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await owner.next(); // arrival
+
+    owner.send({ type: 'position', position: { lat: 52.0, lon: -1.0, accuracyM: 6 } });
+    await friend.next();
+
+    owner.send({ type: 'share', share: false });
+    const dark = (await friend.next())['participant'] as Record<string, unknown>;
+    expect(dark).toMatchObject({ name: 'Stu', owner: true });
+    expect(dark).not.toHaveProperty('position');
+
+    await sleep(1100);
+    owner.send({ type: 'position', position: { lat: 53.0, lon: -2.0, accuracyM: 6 } });
+    await friend.expectNothing();
+
+    // Stated plainly: the record keeps the owner's LAST honoured fix. Going
+    // dark stops the write-through; it does not rewrite what the code
+    // already resolves to, and the record has no field for "not sharing".
+    const stored = await store.get(code);
+    expect(stored!.position.lat).toBe(52.0);
+
+    // A joiner arriving now is welcomed to a roster with a positionless owner.
+    const late = await TestClient.open(url(code));
+    track(late);
+    const welcome = await joined(late, { code, name: 'Late' });
+    const rostered = (welcome['roster'] as Array<Record<string, unknown>>).find(
+      (entry) => entry['owner'] === true,
+    )!;
+    expect(rostered).not.toHaveProperty('position');
+    expect(rostered).not.toHaveProperty('trail');
+  });
+
   it('ends the room when the session expires', async () => {
     const { url, store, track } = await build();
     // Directly stored with a fast expiry — the API's minimum TTL is 60s and

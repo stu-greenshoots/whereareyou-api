@@ -30,6 +30,13 @@ import type {
  * store), while joiners are per-connection. This also means rooms are
  * single-instance; that is on the deferred register, not an accident.
  *
+ * SHARING IS A SWITCH, NOT A FATE. The hello's `share` opens the choice;
+ * setShare() flips it mid-connection, for the OWNER as much as for anyone
+ * else. Going dark keeps the person in the roster and drops their position
+ * — present-but-not-sharing, the shape a watcher has always had — which is
+ * deliberately distinct from disconnected (position kept, disconnectedAt
+ * stamped) and from connected-but-quiet (position kept, lastSeenAt stale).
+ *
  * DISCONNECTING IS NOT LEAVING (protocol 0.2.3). A socket close RETAINS the
  * member in the roster — position, name, avatar, joinedAt, lastSeenAt
  * intact — with disconnectedAt stamped and a `participant` update fanned
@@ -74,6 +81,11 @@ interface Member {
   /** Null once disconnected — the member is retained, the wire is gone. */
   socket: LiveSocket | null;
   state: LiveParticipant;
+  /**
+   * Whether this member's position frames are honoured RIGHT NOW. The hello
+   * sets its opening value; setShare() moves it at will, in both directions,
+   * for owners as much as for anyone else.
+   */
   share: boolean;
   /**
    * The announcement/merge key this member joined under — `n:<hello name>`
@@ -479,6 +491,60 @@ export class LiveRooms {
    * without broadcasting anything. The freshened value travels with the next
    * state fanout or welcome roster.
    */
+  /**
+   * FLIP THE SHARING SWITCH mid-connection. Broadcasting your position is a
+   * choice anyone may change at any time — the hello's `share` is only its
+   * opening value, never a permanent fate. Returns whether anything moved.
+   *
+   * Going dark keeps the person and drops the POSITION: the roster entry
+   * stays, with no `position` and no `disconnectedAt`. That shape is not new
+   * — it is exactly what a watcher has always looked like — and it is
+   * deliberately distinct from the two states around it. A DISCONNECTED
+   * member carries `disconnectedAt` beside their last position (their socket
+   * dropped; the map ghosts them where they were). A CONNECTED-BUT-QUIET
+   * member still has a position and a stale `lastSeenAt` (their phone
+   * locked). This one has chosen to stop, and leaving their old pin up would
+   * be the room asserting a live fix nobody is sending.
+   */
+  setShare(code: string, id: string, share: boolean): boolean {
+    const room = this.#rooms.get(code);
+    const member = room?.members.get(id);
+    if (room === undefined || member === undefined || member.socket === null) return false;
+    if (member.share === share) return false;
+    member.share = share;
+    const now = new Date().toISOString();
+    if (share) {
+      member.state = { ...member.state, lastSeenAt: now, updatedAt: now };
+    } else {
+      const { position: _dropped, ...rest } = member.state;
+      member.state = { ...rest, lastSeenAt: now, updatedAt: now };
+      // The trail travels in the welcome and nowhere else, so keeping it
+      // would hand a LATE joiner the path of somebody who deliberately went
+      // dark. Their history stops where they stopped sharing it.
+      member.trail = [];
+      // Occupancy is rediscovered, never announced, when they resume — the
+      // same silent baseline every join gets. Without this, a walk taken
+      // while dark would fire an 'entered' or 'left' on the first fix back.
+      // `reached` survives on purpose: "at most once per marker id, ever".
+      member.zoneState.clear();
+      member.markerStreaks.clear();
+      member.baselined = false;
+    }
+    this.#broadcast(code, { type: 'participant', participant: member.state });
+    return true;
+  }
+
+  /**
+   * Whether this member's fixes are being honoured right now — the room's
+   * own answer, so nothing has to keep a second copy of the switch. The
+   * route asks before writing the owner's position through to the record: a
+   * fix the room dropped must not reach the store either, or going dark
+   * would stop the map and keep feeding the code.
+   */
+  sharing(code: string, id: string): boolean {
+    return this.#rooms.get(code)?.members.get(id)?.share ?? false;
+  }
+
   touch(code: string, id: string): void {
     const member = this.#rooms.get(code)?.members.get(id);
     if (member === undefined) return;

@@ -52,7 +52,43 @@ const HELLO_TIMEOUT_MS = 10_000;
  * Event-shaped frames (chat, zone-create/remove) stay drop-only — replaying
  * those late would duplicate actions, not converge state.
  */
-const TRAILING_TYPES: ReadonlySet<string> = new Set(['position', 'marker', 'markers', 'sketch']);
+const TRAILING_TYPES: ReadonlySet<string> = new Set(['position', 'marker', 'markers', 'sketch', 'share']);
+
+/**
+ * THE SHARING TOGGLE, read straight off the raw frame.
+ *
+ * Broadcasting your position is a switch anyone may flip at any time — the
+ * hello's `share` is only its opening value — and the protocol has no message
+ * for that yet. So this reads `{"type":"share","share":<bool>}` out of the
+ * frame beside `parseLiveClientMessage`, which is exactly the seam
+ * `extractAvatar()` occupied before `hello.avatar` was typed. DELETE THIS the
+ * moment the protocol carries a `share` client message of its own; there must
+ * never be two spellings of the same field alive at once.
+ *
+ * Safe both ways under the tolerance rule: a pre-toggle server meets an
+ * unrecognised type from a joined participant and simply drops the frame
+ * (one bad frame never ejects someone), and a pre-toggle client never sends
+ * one. It is only ever read from an ALREADY-JOINED connection — junk before
+ * hello stays a refusal.
+ */
+interface ShareFrame {
+  type: 'share';
+  share: boolean;
+}
+
+function parseShareFrame(raw: string): ShareFrame | null {
+  if (raw.length > 16_384) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) return null;
+  const message = value as Record<string, unknown>;
+  if (message['type'] !== 'share' || typeof message['share'] !== 'boolean') return null;
+  return { type: 'share', share: message['share'] };
+}
 
 /** Chat snippet length in a push body — enough to act on, short of a screed. */
 const CHAT_SNIPPET_CHARS = 100;
@@ -122,11 +158,11 @@ export async function registerLive(
       // Trailing-edge delivery for state-replacing frames (TRAILING_TYPES):
       // a floored frame is stashed (latest wins) and applied when the window
       // reopens, so the room converges on the sender's real state.
-      const pending = new Map<string, LiveClientMessage>();
+      const pending = new Map<string, LiveClientMessage | ShareFrame>();
       const pendingTimers = new Map<string, NodeJS.Timeout>();
       let closed = false;
 
-      const deferTrailing = (message: LiveClientMessage, now: number): void => {
+      const deferTrailing = (message: LiveClientMessage | ShareFrame, now: number): void => {
         if (!TRAILING_TYPES.has(message.type)) return;
         pending.set(message.type, message);
         if (pendingTimers.has(message.type)) return; // one armed flush per type
@@ -201,7 +237,12 @@ export async function registerLive(
 
       socket.on('message', (data: Buffer) => {
         void (async () => {
-          const message = parseLiveClientMessage(data.toString());
+          const raw = data.toString();
+          const parsed = parseLiveClientMessage(raw);
+          // The sharing toggle rides beside the protocol types for now — see
+          // parseShareFrame — and only from a connection that has joined.
+          const message: LiveClientMessage | ShareFrame | null =
+            parsed ?? (participantId !== null ? parseShareFrame(raw) : null);
           if (message === null) {
             // Junk before joining is a refusal; junk after is just dropped —
             // one bad frame must not eject someone whose position matters.
@@ -303,8 +344,24 @@ export async function registerLive(
       });
 
       /** Post-join frame handling — called on receipt and from a trailing flush. */
-      const apply = async (message: LiveClientMessage, now: number): Promise<void> => {
+      const apply = async (message: LiveClientMessage | ShareFrame, now: number): Promise<void> => {
         if (closed || code === null || participantId === null || message.type === 'hello') return;
+
+          // The sharing switch. Nothing is persisted: the session record's
+          // `position` is the owner's LAST honoured fix and stays exactly
+          // that — going dark stops the write-through rather than rewriting
+          // history. The record has no field for "not sharing", which is
+          // the one thing this cannot say without a protocol change.
+          if (message.type === 'share') {
+            if (rooms.setShare(code, participantId, message.share)) {
+              // A boolean about consent, never a coordinate.
+              request.log.info(
+                { event: 'live.share', code, participantId, owner: isOwner, share: message.share },
+                'sharing toggled',
+              );
+            }
+            return;
+          }
 
           if (message.type === 'position') {
             const events = rooms.position(code, participantId, message.position);
@@ -318,7 +375,10 @@ export async function registerLive(
             if (events.length > 0) await persistLive();
             // The owner's pin is the session — keep the record truthful for
             // anyone resolving without a socket. Never extends the TTL.
-            if (isOwner) {
+            // Gated on the room's own view of the switch: a fix the relay
+            // dropped must not reach the store either, or an owner who went
+            // dark would stop the map and keep feeding the code.
+            if (isOwner && rooms.sharing(code, participantId)) {
               await store.update(code, { position: message.position, updatedAt: now });
             }
             return;
