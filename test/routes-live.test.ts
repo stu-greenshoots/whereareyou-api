@@ -318,6 +318,77 @@ describe('live room state', () => {
     expect(await owner.next()).toMatchObject({ participant: { name: 'Sam', position: { lat: 51.8 } } });
   });
 
+  it('drops a malformed share rather than guessing or ejecting', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken });
+    const friend = await TestClient.open(url(code));
+    track(friend);
+    await joined(friend, { code, name: 'Sam' });
+    await owner.next(); // Sam's arrival
+
+    // "false" is a string, not a decision. The protocol parser wants a
+    // strict boolean, so the frame is malformed — and malformed after
+    // joining means dropped, never a refusal that ejects someone.
+    friend.send({ type: 'share', share: 'false' });
+    await owner.expectNothing();
+    expect(friend.closed).toBe(false);
+
+    // The switch never moved: their fixes still land.
+    friend.send({ type: 'position', position: { lat: 51.6, lon: -0.2, accuracyM: 12 } });
+    expect(await owner.next()).toMatchObject({ participant: { name: 'Sam', position: { lat: 51.6 } } });
+  });
+
+  it('ignores a share arriving before the hello, like any typed message', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const early = await TestClient.open(url(code));
+    track(early);
+
+    // One corner moved when the message became typed, deliberately: a
+    // pre-hello `share` is now a VALID frame out of order, so it is ignored
+    // exactly as an early `position` always was — not a `bad-message`
+    // refusal. The connection survives and the hello behind it still lands.
+    early.send({ type: 'share', share: false });
+    early.send({ type: 'position', position: POSITION });
+    await early.expectNothing();
+    expect(early.closed).toBe(false);
+    expect(await joined(early, { code, updateToken })).toMatchObject({ type: 'welcome' });
+  });
+
+  it('reports the switch on the wire, so "no fix yet" reads apart from "not sharing"', async () => {
+    const { app, url, track } = await build();
+    const { code, updateToken } = await mintLive(app);
+    const owner = await TestClient.open(url(code));
+    track(owner);
+    await joined(owner, { code, updateToken, name: 'Stu' });
+
+    const watcher = await TestClient.open(url(code));
+    track(watcher);
+    const welcome = await joined(watcher, { code, share: false, name: 'Dispatcher' });
+    const rostered = (welcome['roster'] as Array<Record<string, unknown>>)[0]!;
+    // Sharing, no fix sent yet: a pin to WAIT for. Without `sharing` this
+    // is indistinguishable from the watcher below, which is the coarseness
+    // protocol 0.2.4 removes.
+    expect(rostered).toMatchObject({ name: 'Stu', sharing: true });
+    expect(rostered).not.toHaveProperty('position');
+
+    expect(await owner.next()).toMatchObject({
+      type: 'participant',
+      participant: { name: 'Dispatcher', sharing: false },
+    });
+
+    owner.send({ type: 'position', position: POSITION });
+    expect(await watcher.next()).toMatchObject({ participant: { sharing: true, position: { lat: POSITION.lat } } });
+
+    owner.send({ type: 'share', share: false });
+    const dark = (await watcher.next())['participant'] as Record<string, unknown>;
+    expect(dark).toMatchObject({ name: 'Stu', sharing: false });
+    expect(dark).not.toHaveProperty('position');
+  });
+
   it('lets the OWNER run the session while broadcasting nothing', async () => {
     const { app, url, store, track } = await build();
     const { code, updateToken } = await mintLive(app);

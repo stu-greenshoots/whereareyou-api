@@ -297,6 +297,58 @@ describe('sharing is a switch, not a fate', () => {
     rooms.stop();
   });
 
+  it('reports the switch on the participant (protocol 0.2.4)', () => {
+    const { rooms, sockets, ids } = roomOf(2);
+    // A join says which way the switch opened.
+    expect(sockets[0]!.ofType('participant').at(-1)!['participant']).toMatchObject({
+      id: ids[1],
+      sharing: true,
+    });
+
+    rooms.setShare('CODE1', ids[1]!, false);
+    expect(sockets[0]!.ofType('participant').at(-1)!['participant']).toMatchObject({
+      id: ids[1],
+      sharing: false,
+    });
+
+    // Back on with no fix yet — `sharing: true` and NO position. This is the
+    // pair the field exists to tell apart: a pin to wait for, versus one
+    // nobody is going to send. The room never resurrects what it dropped.
+    rooms.setShare('CODE1', ids[1]!, true);
+    const resumed = sockets[0]!.ofType('participant').at(-1)!['participant'] as Record<string, unknown>;
+    expect(resumed['sharing']).toBe(true);
+    expect(resumed).not.toHaveProperty('position');
+    rooms.stop();
+  });
+
+  it('keeps the switch orthogonal to the wire, and off the persisted blob', () => {
+    const { rooms, ids } = roomOf(2);
+    rooms.position('CODE1', ids[1]!, fix(0));
+
+    // A ghost keeps whatever the switch last said — intent and wire are
+    // different facts, and disconnectedAt is what makes them a ghost.
+    const state = rooms.disconnect('CODE1', ids[1]!)!;
+    const late = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (late === 'room-full') throw new Error('unreachable');
+    const ghost = late.roster.find((entry) => entry.id === ids[1])!;
+    expect(ghost.sharing).toBe(true);
+    expect(ghost.disconnectedAt).toEqual(expect.any(String));
+    expect(ghost.position).toBeDefined();
+
+    // A watcher's own entry says so plainly.
+    expect(late.roster.find((entry) => entry.id === late.id)).toBeUndefined(); // not in their own roster
+    const watcherView = rooms.join('CODE1', new FakeSocket(), { owner: false, share: false, expiresAt: soon() });
+    if (watcherView === 'room-full') throw new Error('unreachable');
+    expect(watcherView.roster.find((entry) => entry.id === late.id)!.sharing).toBe(false);
+
+    // But the persisted snapshot carries no `sharing`: a recreated room has
+    // no live switch to report, and absent means "not reported".
+    const snapshot = state.participants.find((entry) => entry.id === ids[1])!;
+    expect(snapshot.position).toBeDefined();
+    expect('sharing' in snapshot).toBe(false);
+    rooms.stop();
+  });
+
   it('lets the OWNER run a session while broadcasting nothing', () => {
     const { rooms, sockets, ids } = roomOf(2);
     rooms.position('CODE1', ids[0]!, fix(0));

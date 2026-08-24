@@ -221,6 +221,12 @@ export const MAX_DISCONNECTED_RETAINED = 20;
  * blob: identity and last-known whereabouts only. Trails stay memory-only
  * by design; sketches and markers vanish with the connection (the web
  * replays markers on rejoin).
+ *
+ * `sharing` is DELIBERATELY not in this allowlist. The field reports a live
+ * switch, and a recreated room holds no connection to report one from; the
+ * rehydrated ghost carries `share: false` internally, so persisting a stale
+ * `true` beside it would be two spellings disagreeing. Absent means "not
+ * reported", which is the honest answer here.
  */
 function snapshotOf(state: LiveParticipant): LiveParticipant {
   return {
@@ -373,6 +379,11 @@ export class LiveRooms {
     const state: LiveParticipant = {
       id,
       owner: options.owner,
+      // The switch, reported on the wire (0.2.4) so a client can tell
+      // "sharing, no fix yet" from "chose not to broadcast" — a distinction
+      // the absence of `position` alone cannot make. Advisory: `position`
+      // stays the authority on whether there IS a fix.
+      sharing: options.share,
       joinedAt: now,
       lastSeenAt: now,
       updatedAt: now,
@@ -505,6 +516,10 @@ export class LiveRooms {
    * member still has a position and a stale `lastSeenAt` (their phone
    * locked). This one has chosen to stop, and leaving their old pin up would
    * be the room asserting a live fix nobody is sending.
+   *
+   * Since protocol 0.2.4 the switch itself also rides on the wire as
+   * `LiveParticipant.sharing`, so a client need no longer read the three
+   * apart from the absence of a position alone.
    */
   setShare(code: string, id: string, share: boolean): boolean {
     const room = this.#rooms.get(code);
@@ -514,10 +529,13 @@ export class LiveRooms {
     member.share = share;
     const now = new Date().toISOString();
     if (share) {
-      member.state = { ...member.state, lastSeenAt: now, updatedAt: now };
+      // `sharing: true` with no position is the "a fix is coming" state —
+      // the room never resurrects the position it dropped, so they reappear
+      // on the map only on their next real fix.
+      member.state = { ...member.state, sharing: true, lastSeenAt: now, updatedAt: now };
     } else {
       const { position: _dropped, ...rest } = member.state;
-      member.state = { ...rest, lastSeenAt: now, updatedAt: now };
+      member.state = { ...rest, sharing: false, lastSeenAt: now, updatedAt: now };
       // The trail travels in the welcome and nowhere else, so keeping it
       // would hand a LATE joiner the path of somebody who deliberately went
       // dark. Their history stops where they stopped sharing it.
